@@ -13,13 +13,13 @@ Adds a `CLIProxyAPI` model provider based on the OpenAI Responses API to DeepSee
 
 ## Install
 
-```powershell
-npx @deepseek-ai/dsh plugin --profile web add github:gray0128/dsh-cliproxyapi-provider
+```bash
+npx @deepseek-ai/dsh plugin --profile web add @gray0128/dsh-cliproxyapi-provider
 ```
 
 Start or restart DeepSeek Harness Web afterwards:
 
-```powershell
+```bash
 npx @deepseek-ai/dsh web
 ```
 
@@ -28,16 +28,16 @@ npx @deepseek-ai/dsh web
 After opening Harness:
 
 1. Go to **Settings → Plugins → CLIProxyAPI**.
-2. Enter the CLIProxyAPI **API URL**, for example `http://127.0.0.1:8317/v1`.
+2. Enter the **Base URL**, for example `http://127.0.0.1:8317/v1`.
 3. Enter the **API key**. Leave it empty if the service does not require authentication.
-4. Save the configuration. The model list is retrieved automatically and refreshed periodically.
+4. Click **Save & Enable**. The model list is retrieved automatically and refreshed periodically.
 
 On save, the plugin writes the models into the `CLIProxyAPI` entry of the built-in `llm-pi-ai` provider configuration, so they appear in the model picker immediately.
 
 ## How it works
 
-- **Model discovery**: requests `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider` (Codex-style `models` array) and `GET {baseURL}/models` (standard OpenAI-style `data` array) in parallel, merging capacity, input modalities, and reasoning levels by model ID. The standard catalog also serves as a fallback when the Codex catalog is unavailable. Missing fields fall back to the plugin defaults.
-- **Single directory owner**: the plugin registers no provider directory of its own. It only maintains the `CLIProxyAPI` entry inside `llm-pi-ai`, and the built-in pi-ai adapter owns routing and requests.
+- **Model discovery**: requests `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider` (Codex-style `models` array) and `GET {baseURL}/models` (standard OpenAI-style `data` array) in parallel, merging capacity, input modalities, and reasoning levels by model ID (reading both `supported_reasoning_levels` and `thinking.levels` / `zero_allowed`, with canonical `max` prioritized over `ultra`). If either endpoint fails, times out, or filters to an empty list, discovery degrades to the responding catalog. Missing fields fall back to the plugin defaults, and `maxTokens` is clamped to `contextWindow` unless explicitly overridden.
+- **Single directory owner**: the plugin registers no provider directory of its own. It only maintains the `CLIProxyAPI` entry inside `llm-pi-ai`, and the built-in `pi-ai` adapter owns routing and requests.
 - **Credentials**: the API key is stored as the DSH credential `DSH_CLIPROXY_API_KEY` and never written to the configuration file. Without a key the plugin sends a placeholder `Authorization` header so requests still go out.
 - **Refresh**: the catalog refreshes every 5 minutes by default. Failures retry with exponential backoff from 3 seconds up to 60 seconds, and an unchanged error is logged once.
 
@@ -48,19 +48,19 @@ The defaults suit most deployments. To change them, set `config` on the `llm-cli
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `defaultContextWindow` | `262144` | Context window used when the catalog omits one |
-| `defaultMaxTokens` | `32768` | Max output used when the catalog omits one |
+| `defaultMaxTokens` | `32768` | Max output used when the catalog omits one (clamped to `contextWindow` unless overridden) |
 | `defaultInput` | `["text"]` | Input modalities used when the catalog omits them; may include `image` |
 | `excludedModels` | `[]` | Hides models by ID; supports the `*` wildcard, for example `["*-preview"]` |
 | `modelOverrides` | `{}` | Per-model overrides for `name`, `contextWindow`, `maxTokens`, `input`, and `reasoningEfforts`; `reasoningEfforts: false` declares a non-reasoning model |
 | `headers` | `{}` | Extra request headers for catalog and model requests |
-| `fetchTimeoutMs` | `15000` | Timeout for one catalog request |
-| `retryInitialMs` | `3000` | First retry delay |
-| `retryMaxMs` | `60000` | Retry delay ceiling |
-| `refreshIntervalMs` | `300000` | Catalog refresh interval; `0` disables periodic refreshes |
+| `fetchTimeoutMs` | `15000` | Timeout for one catalog request (ms) |
+| `retryInitialMs` | `3000` | First retry delay (ms) |
+| `retryMaxMs` | `60000` | Retry delay ceiling (ms) |
+| `refreshIntervalMs` | `300000` | Catalog refresh interval (ms); `0` disables periodic refreshes |
 
 ## Uninstall
 
-```powershell
+```bash
 npx @deepseek-ai/dsh plugin --profile web remove @gray0128/dsh-cliproxyapi-provider
 ```
 
