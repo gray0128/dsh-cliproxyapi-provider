@@ -2,36 +2,74 @@
 
 English | [简体中文](./README.md)
 
-Adds a `CLIProxyAPI` model provider based on the OpenAI Responses API to DeepSeek Harness.
+> This repository is derived from [router-for-me/dsh-cliproxyapi-provider](https://github.com/router-for-me/dsh-cliproxyapi-provider) and migrates it to the DeepSeek Harness 0.2.1-rc.3 host APIs.
 
-The plugin automatically retrieves the model list from CLIProxyAPI, so models do not need to be added or maintained manually.
+Adds a `CLIProxyAPI` model provider based on the OpenAI Responses API to DeepSeek Harness. The plugin retrieves the model catalog from CLIProxyAPI automatically, so models never need to be maintained by hand.
 
-## Usage
+## Requirements
 
-Install the plugin:
+- DeepSeek Harness `0.2.1-rc.3` or later, before `0.2.2`
+- Node.js 22 or later
+
+## Install
 
 ```powershell
 npx @deepseek-ai/dsh plugin --profile web add github:gray0128/dsh-cliproxyapi-provider
 ```
 
-Start or restart DeepSeek Harness Web:
+Start or restart DeepSeek Harness Web afterwards:
 
 ```powershell
 npx @deepseek-ai/dsh web
 ```
 
+## Usage
+
 After opening Harness:
 
 1. Go to **Settings → Plugins → CLIProxyAPI**.
-2. Enter the CLIProxyAPI **API URL**, for example
-   `http://127.0.0.1:8317/v1`.
+2. Enter the CLIProxyAPI **API URL**, for example `http://127.0.0.1:8317/v1`.
 3. Enter the **API key**. Leave it empty if the service does not require authentication.
-4. Save the configuration. The model list will be retrieved automatically and refreshed periodically.
+4. Save the configuration. The model list is retrieved automatically and refreshed periodically.
 
-Uninstall the plugin:
+On save, the plugin writes the models into the `CLIProxyAPI` entry of the built-in `llm-pi-ai` provider configuration, so they appear in the model picker immediately.
+
+## How it works
+
+- **Model discovery**: requests `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider` and reads a Codex-style `models` array, mapping model ID, display name, context window, max output, input modalities, and reasoning levels. Missing fields fall back to the plugin defaults.
+- **Single directory owner**: the plugin registers no provider directory of its own. It only maintains the `CLIProxyAPI` entry inside `llm-pi-ai`, and the built-in pi-ai adapter owns routing and requests.
+- **Credentials**: the API key is stored as the DSH credential `DSH_CLIPROXY_API_KEY` and never written to the configuration file. Without a key the plugin sends a placeholder `Authorization` header so requests still go out.
+- **Refresh**: the catalog refreshes every 5 minutes by default. Failures retry with exponential backoff from 3 seconds up to 60 seconds, and an unchanged error is logged once.
+
+## Configuration
+
+The defaults suit most deployments. To change them, set `config` on the `llm-cliproxyapi` entry in the profile's `cordis.patch.yml`; a patch replaces that entry's whole config, so list every field you need.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `defaultContextWindow` | `262144` | Context window used when the catalog omits one |
+| `defaultMaxTokens` | `32768` | Max output used when the catalog omits one |
+| `defaultInput` | `["text"]` | Input modalities used when the catalog omits them; may include `image` |
+| `headers` | `{}` | Extra request headers for catalog and model requests |
+| `fetchTimeoutMs` | `15000` | Timeout for one catalog request |
+| `retryInitialMs` | `3000` | First retry delay |
+| `retryMaxMs` | `60000` | Retry delay ceiling |
+| `refreshIntervalMs` | `300000` | Catalog refresh interval; `0` disables periodic refreshes |
+
+## Uninstall
 
 ```powershell
 npx @deepseek-ai/dsh plugin --profile web remove @gray0128/dsh-cliproxyapi-provider
 ```
 
-Restart DeepSeek Harness Web after uninstalling the plugin.
+Restart DeepSeek Harness Web after uninstalling.
+
+## Troubleshooting
+
+- **“incompatible with DSH” warning**: the plugin version does not match the running DSH. Upgrade the plugin rather than granting `dsh plugin allow-version` — it relies on the 0.2.1-rc.3 host APIs and would still fail to load once the check is bypassed.
+- **401 or 403**: save a valid API key in Settings.
+- **Empty model list after saving**: make sure CLIProxyAPI answers `/models` with a Codex-style `models` array holding at least one usable model.
+
+## License
+
+MIT, see [package.json](./package.json).
