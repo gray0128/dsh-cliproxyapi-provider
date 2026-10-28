@@ -162,14 +162,23 @@ test('initial profile waits until the host writes complete model capabilities', 
         async discoverModels(settingsNs, request) {
           discoveryNamespace = settingsNs
           discoveryRequest = request
-          return ok([{
-            id: 'gpt-5.6-sol',
-            name: 'GPT 5.6 Sol',
-            contextWindow: 372000,
-            maxTokens: 128000,
-            input: ['text', 'image'],
-            reasoningEfforts: { low: 'low', high: 'high' },
-          }])
+          return ok([
+            {
+              id: 'gpt-5.6-sol',
+              name: 'GPT 5.6 Sol',
+              contextWindow: 372000,
+              maxTokens: 128000,
+              input: ['text', 'image'],
+              reasoningEfforts: { low: 'low', high: 'high' },
+            },
+            {
+              id: 'gemini-3-pro',
+              name: 'Gemini 3 Pro',
+              contextWindow: 1048576,
+              maxTokens: 65536,
+              inputModalities: ['text', 'image'],
+            },
+          ])
         },
       },
     }
@@ -202,6 +211,8 @@ test('initial profile waits until the host writes complete model capabilities', 
     assert.deepEqual(bootstrap.models[0].input, ['text', 'image'])
     assert.deepEqual(bootstrap.models[0].reasoningEfforts, { low: 'low', high: 'high' })
     assert.equal(bootstrap.models[0].maxTokens, 128000)
+    assert.deepEqual(bootstrap.models[1].input, ['text', 'image'])
+    assert.equal(bootstrap.models[1].maxTokens, 65536)
     assert.match(bootstrap.headers['x-dsh-provider-cpa-sync'], /^rich:/)
     const validated = await PiAiConfig['~standard'].validate({
       providers: { CLIProxyAPI: bootstrap },

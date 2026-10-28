@@ -4,6 +4,7 @@ import {
   catalogURL,
   mergeCatalogPayloads,
   modelProfileOf,
+  readCatalog,
   readCodexCatalog,
   reasoningEffortsOf,
   standardCatalogURL,
@@ -168,10 +169,18 @@ test('reads standard OpenAI catalogs with heterogeneous channel fields', () => {
   ])
 })
 
-test('uses configured fallbacks when catalog capability fields are absent', () => {
+test('uses configured and built-in fallbacks when catalog capability fields are absent', () => {
+  assert.equal(readCatalog, readCodexCatalog)
   assert.deepEqual(modelProfileOf({ slug: 'fallback-model' }, defaults), {
     id: 'fallback-model',
     name: 'fallback-model',
+    contextWindow: 262144,
+    maxTokens: 32768,
+    input: ['text'],
+  })
+  assert.deepEqual(modelProfileOf({ slug: 'default-options-model' }), {
+    id: 'default-options-model',
+    name: 'default-options-model',
     contextWindow: 262144,
     maxTokens: 32768,
     input: ['text'],

@@ -7,8 +7,9 @@ import {
   catalogEntriesOf,
   catalogURL,
   mergeCatalogPayloads,
-  readCodexCatalog,
+  readCatalog,
   standardCatalogURL,
+  trimBaseURL,
 } from './catalog.js'
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024
@@ -47,7 +48,7 @@ export const Config = z.object({
 })
 
 function normalizedBaseURL(value) {
-  const baseURL = String(value ?? '').trim().replace(/\/+$/, '')
+  const baseURL = trimBaseURL(value)
   if (!baseURL) throw new TypeError('CLIProxyAPI baseURL must not be empty')
   let parsed
   try {
@@ -59,6 +60,16 @@ function normalizedBaseURL(value) {
     throw new TypeError('CLIProxyAPI baseURL must use http or https')
   }
   return baseURL
+}
+
+function catalogConfigOf(config) {
+  return {
+    defaultContextWindow: config.defaultContextWindow,
+    defaultMaxTokens: config.defaultMaxTokens,
+    defaultInput: config.defaultInput,
+    excludedModels: config.excludedModels,
+    modelOverrides: config.modelOverrides,
+  }
 }
 
 function headerKey(headers, expected) {
@@ -164,31 +175,37 @@ async function readBoundedJson(response) {
   return JSON.parse(new TextDecoder().decode(bytes))
 }
 
-async function fetchCatalogBody(url, options, apiKey, signal) {
-  let response
+async function fetchCatalogBody(url, options, apiKey, parentSignal) {
+  const request = timedSignal(parentSignal, options.fetchTimeoutMs)
+  const { signal } = request
   try {
-    response = await fetch(url, {
-      method: 'GET',
-      signal,
-      headers: {
-        accept: 'application/json',
-        ...options.headers,
-        ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}),
-        ...attributionHeaders(),
-      },
-    })
-  } catch (error) {
-    if (signal.aborted) throw signal.reason ?? error
-    throw new Error('Could not reach CLIProxyAPI at ' + url, { cause: error })
-  }
-  if (!response.ok) {
-    throw new Error('CLIProxyAPI model catalog answered ' + response.status + ((response.status === 401 || response.status === 403) ? '; save a valid API key in Settings' : ''))
-  }
-  try {
-    return await readBoundedJson(response)
-  } catch (error) {
-    if (signal.aborted) throw signal.reason ?? error
-    throw new Error('CLIProxyAPI model catalog did not return usable JSON', { cause: error })
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        signal,
+        headers: {
+          accept: 'application/json',
+          ...options.headers,
+          ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}),
+          ...attributionHeaders(),
+        },
+      })
+    } catch (error) {
+      if (signal.aborted) throw signal.reason ?? error
+      throw new Error('Could not reach CLIProxyAPI at ' + url, { cause: error })
+    }
+    if (!response.ok) {
+      throw new Error('CLIProxyAPI model catalog answered ' + response.status + ((response.status === 401 || response.status === 403) ? '; save a valid API key in Settings' : ''))
+    }
+    try {
+      return await readBoundedJson(response)
+    } catch (error) {
+      if (signal.aborted) throw signal.reason ?? error
+      throw new Error('CLIProxyAPI model catalog did not return usable JSON', { cause: error })
+    }
+  } finally {
+    request.dispose()
   }
 }
 
@@ -196,50 +213,64 @@ function hasCatalogEntries(body) {
   return (catalogEntriesOf(body)?.length ?? 0) > 0
 }
 
+function readCatalogError(error) {
+  return new Error(
+    'Could not read the CLIProxyAPI model catalog: '
+    + (error instanceof Error ? error.message : String(error)),
+    { cause: error },
+  )
+}
+
+function resolveCatalogModels(primary, standard, options) {
+  const candidates = []
+  if (primary.status === 'fulfilled' && hasCatalogEntries(primary.value)) {
+    candidates.push(
+      standard.status === 'fulfilled'
+        ? mergeCatalogPayloads(primary.value, standard.value)
+        : primary.value,
+    )
+  }
+  if (standard.status === 'fulfilled' && hasCatalogEntries(standard.value)) {
+    candidates.push(standard.value)
+  }
+  let lastError
+  for (const body of candidates) {
+    try {
+      return readCatalog(body, options)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (lastError) throw readCatalogError(lastError)
+  if (primary.status === 'rejected') throw primary.reason
+  if (primary.status === 'fulfilled') {
+    try {
+      return readCatalog(primary.value, options)
+    } catch (error) {
+      throw readCatalogError(error)
+    }
+  }
+  throw standard.reason
+}
+
 async function discoverCatalog(ctx, options, suppliedApiKey, parentSignal) {
   const apiKey = await optionalApiKey(ctx, suppliedApiKey)
   const baseURL = normalizedBaseURL(options.baseURL)
   const primaryURL = catalogURL(baseURL)
   const standardURL = standardCatalogURL(baseURL)
-  const request = timedSignal(parentSignal, options.fetchTimeoutMs)
-  try {
-    // Codex clients get a rich catalog while standard OpenAI clients get the
-    // channel registry. Query both and let the richer payload win per model.
-    const [primary, standard] = await Promise.allSettled([
-      fetchCatalogBody(primaryURL, options, apiKey, request.signal),
-      fetchCatalogBody(standardURL, options, apiKey, request.signal),
-    ])
-    if (request.signal.aborted) {
-      throw request.signal.reason ?? new Error('CLIProxyAPI model catalog request was aborted')
-    }
-    let body
-    if (primary.status === 'fulfilled' && hasCatalogEntries(primary.value)) {
-      body = standard.status === 'fulfilled'
-        ? mergeCatalogPayloads(primary.value, standard.value)
-        : primary.value
-    } else if (standard.status === 'fulfilled' && hasCatalogEntries(standard.value)) {
-      body = standard.value
-    } else if (primary.status === 'rejected') {
-      throw primary.reason
-    } else if (primary.status === 'fulfilled') {
-      body = primary.value
-    } else {
-      throw standard.reason
-    }
-    try {
-      return {
-        models: readCodexCatalog(body, options),
-        hasApiKey: apiKey !== undefined,
-      }
-    } catch (error) {
-      throw new Error(
-        'Could not read the CLIProxyAPI model catalog: '
-        + (error instanceof Error ? error.message : String(error)),
-        { cause: error },
-      )
-    }
-  } finally {
-    request.dispose()
+  // Codex clients get a rich catalog while standard OpenAI clients get the
+  // channel registry. Query both with independent timeouts and let the richer
+  // payload win per model.
+  const [primary, standard] = await Promise.allSettled([
+    fetchCatalogBody(primaryURL, options, apiKey, parentSignal),
+    fetchCatalogBody(standardURL, options, apiKey, parentSignal),
+  ])
+  if (parentSignal?.aborted) {
+    throw parentSignal.reason ?? new Error('CLIProxyAPI model catalog request was aborted')
+  }
+  return {
+    models: resolveCatalogModels(primary, standard, options),
+    hasApiKey: apiKey !== undefined,
   }
 }
 
@@ -254,7 +285,7 @@ function refreshKeyOf(profile, config) {
   return JSON.stringify({
     displayName: profile.displayName,
     api: profile.api,
-    baseURL: String(profile.baseURL ?? '').trim().replace(/\/+$/, ''),
+    baseURL: trimBaseURL(profile.baseURL),
     models: profile.models,
     defaultContextWindow: profile.defaultContextWindow,
     defaultMaxTokens: profile.defaultMaxTokens,
@@ -309,12 +340,8 @@ export function apply(ctx, config) {
   if (config.retryMaxMs < config.retryInitialMs) throw new Error('retryMaxMs must be greater than or equal to retryInitialMs')
 
   const catalogFor = (profile, signal) => discoverCatalog(ctx, {
+    ...catalogConfigOf(config),
     baseURL: profile.baseURL,
-    defaultContextWindow: config.defaultContextWindow,
-    defaultMaxTokens: config.defaultMaxTokens,
-    defaultInput: config.defaultInput,
-    excludedModels: config.excludedModels,
-    modelOverrides: config.modelOverrides,
     headers: catalogHeadersOf(profile.headers, config.headers),
     fetchTimeoutMs: config.fetchTimeoutMs,
   }, undefined, signal)
@@ -343,19 +370,18 @@ export function apply(ctx, config) {
     return handoff.models
   }
 
-  ctx.llm.registerModelDiscovery(DISCOVERY_NS, async (request) => {
+  ctx.llm.registerModelDiscovery(DISCOVERY_NS, async (request, signal) => {
     const catalog = await discoverCatalog(ctx, {
+      ...catalogConfigOf(config),
       baseURL: request.baseURL,
-      defaultContextWindow: config.defaultContextWindow,
-      defaultMaxTokens: config.defaultMaxTokens,
-      defaultInput: config.defaultInput,
-      excludedModels: config.excludedModels,
-      modelOverrides: config.modelOverrides,
       headers: config.headers,
       fetchTimeoutMs: config.fetchTimeoutMs,
-    }, request.apiKey, request.signal)
+    }, request.apiKey, signal ?? request?.signal)
     rememberDiscovery(request.baseURL, catalog.models)
-    return catalog.models
+    return catalog.models.map((model) => Object.defineProperty({ ...model }, 'inputModalities', {
+      value: model.input,
+      configurable: true,
+    }))
   })
 
   let observedRefreshKey

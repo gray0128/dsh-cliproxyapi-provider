@@ -9,7 +9,7 @@
 | 模块名称 | 所属层级 | 核心职责 | 样本来源 |
 | --- | --- | --- | --- |
 | `@deepseek-ai/dsh-llm` | DSH 宿主服务层 | 注册模型发现入口、校验调用控制项、执行多模态降级投影与上下文溢出判定 | `node_modules/@deepseek-ai/dsh-llm`（`0.2.1-rc.3`） |
-| `@deepseek-ai/dsh-llm-pi-ai` | DSH 多提供方适配层 | 合并离线模型目录与自定义路由配置、解析端点模型列表、映射推理档位与协议兼容开关 | `node_modules/@deepseek-ai/dsh-llm-pi-ai`（`0.2.1-rc.3`） |
+| `@deepseek-ai/dsh-llm-pi-ai` | DSH 多供应商适配层 | 合并离线模型目录与自定义路由配置、解析端点模型列表、映射推理档位与协议兼容开关 | `node_modules/@deepseek-ai/dsh-llm-pi-ai`（`0.2.1-rc.3`） |
 | `dsh-workbuddy-connect` / `pi-workbuddy-connect` | 第三方桌面端桥接插件 | 拉取动态配置目录、执行三阶段推理档位主动探测、清洗非标网关请求体 | 本地仓库 `dsh-workbuddy-connect`（`0.7.9`）、`pi-workbuddy-connect`（`0.1.0`） |
 | `@mars-sea/dsh-commandcode-provider` | 第三方网关直连插件 | 结合离线 `models.dev` 上限表与运行时错误响应自学习单轮输出上限、支持按模型覆盖窗口 | 本地已安装包 `@mars-sea/dsh-commandcode-provider` |
 | `dsh-opencode-go` | 第三方订阅网关插件 | 融合网关实时模型 ID 列表与 `models.dev` 在线能力元数据、区分三类推理控制模式 | 本地已安装包 `dsh-opencode-go` |
@@ -129,8 +129,8 @@ OpenCode Go 网关的 `/models` 列表仅提供可用模型 ID，缺少完整的
 
 综合上述同类插件的设计约束与宿主校验逻辑，模型参数探测与自动调整必须遵守以下可验证不变量：
 
-1. **单一目录所有权不变量**：通过 `llm-pi-ai` 路由模型的提供方插件 `禁止` 调用 `ctx.llm.registerConfigurableProviders()` 注册同名提供方目录。违反该规则会导致宿主抛出重复提供方冲突或争夺 Models 设置页所有权（验证基准：[`test/index.test.js`](../test/index.test.js#L56-L58) 与 [`test/index.test.js`](../test/index.test.js#L427-L490)）。
-2. **推理映射非空且有效不变量**：写入 `llm-pi-ai` 的模型条目中，`reasoningEfforts` 对象 `不得` 为空字典，且 `不得` 仅包含 `off` 单个键。违反该规则会导致 `@deepseek-ai/dsh-llm-pi-ai` 的 Schema 校验或 `resolveModelReasoning` 直接拒绝整个提供方配置并抛出 `llm-pi-ai rejected the generated provider profile`（参见 [`node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js`](../node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js#L589-L598)）。
+1. **单一目录所有权不变量**：通过 `llm-pi-ai` 路由模型的供应商插件 `禁止` 调用 `ctx.llm.registerConfigurableProviders()` 注册同名供应商目录。违反该规则会导致宿主抛出重复供应商冲突或争夺 Models 设置页所有权（验证基准：[`test/index.test.js`](../test/index.test.js#L56-L58) 与 [`test/index.test.js`](../test/index.test.js#L427-L490)）。
+2. **推理映射非空且有效不变量**：写入 `llm-pi-ai` 的模型条目中，`reasoningEfforts` 对象 `不得` 为空字典，且 `不得` 仅包含 `off` 单个键。违反该规则会导致 `@deepseek-ai/dsh-llm-pi-ai` 的 Schema 校验或 `resolveModelReasoning` 直接拒绝整个供应商配置并抛出 `llm-pi-ai rejected the generated provider profile`（参见 [`node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js`](../node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js#L589-L598)）。
 3. **响应字节上限不变量**：任何向用户配置端点发起的模型列表读取操作 `MUST` 在 `Content-Length` 预检与流式分片读取两处强制执行 `4,194,304` 字节（4 MiB）上限。超过上限时必须立即取消读取流并抛出错误，防止异常网关耗尽宿主进程内存（参见 [`src/index.js`](../src/index.js#L121-L149)）。
 4. **无密钥占位鉴权不变量**：当 `DSH_CLIPROXY_API_KEY` 未配置时，写入 `llm-pi-ai` 的 Profile `MUST` 省略 `apiKeyEnv` 字段，并在 `headers.authorization` 中写入非敏感占位值 `Bearer dsh-cliproxyapi-no-key`；而在向 CLIProxyAPI 发起 `/models` 目录探测时 `MUST` 剥离该占位头。违反该规则会导致无鉴权网关下的对话请求因缺少凭据在 `pi-ai` 层以 `MISSING_CREDENTIAL` 失败，或导致开启了可选鉴权校验的目录端点返回 401（参见 [`src/index.js`](../src/index.js#L73-L94)）。
 5. **配置变更幂等写入不变量**：后台定时刷新与事件触发同步在生成的 `next` Profile 与当前已存储 `profile` 深度相等（`deepEqualJson(next, profile) === true`）时 `禁止` 调用 `ctx.settings.mutate`。违反该规则会触发 `settings/document-updated` 事件循环并导致宿主反复重建 `pi-ai` 模型快照（参见 [`src/index.js`](../src/index.js#L328-L335)）。

@@ -1,6 +1,9 @@
 const CANONICAL_REASONING_LEVELS = new Set([
   'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
 ])
+const DEFAULT_CONTEXT_WINDOW = 262144
+const DEFAULT_MAX_TOKENS = 32768
+const DEFAULT_INPUT = ['text']
 
 function positiveInteger(...values) {
   for (const value of values) {
@@ -12,6 +15,16 @@ function nonEmptyString(...values) {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim()
   }
+}
+
+function modelIdOf(entry) {
+  return nonEmptyString(entry?.slug, entry?.id, entry?.model)
+}
+
+function usableReasoningEfforts(efforts) {
+  const keys = Object.keys(efforts)
+  if (!keys.length || keys.every((level) => level === 'off')) return undefined
+  return efforts
 }
 
 function isPresent(value) {
@@ -62,8 +75,7 @@ export function reasoningEffortsOf(entry) {
   }
   // llm-pi-ai rejects a capability map that offers only "off". Omitting the
   // field correctly describes a non-reasoning model for a hand-declared route.
-  if (!Object.keys(efforts).length || Object.keys(efforts).every((level) => level === 'off')) return undefined
-  return efforts
+  return usableReasoningEfforts(efforts)
 }
 
 function modalitiesOf(values) {
@@ -143,14 +155,13 @@ function overriddenReasoningEfforts(override, id) {
   }
   // An empty or off-only map cannot be represented in llm-pi-ai; ignore the
   // override instead of writing a capability map the host would reject.
-  if (!Object.keys(efforts).length || Object.keys(efforts).every((level) => level === 'off')) {
-    return { applied: false }
-  }
-  return { applied: true, efforts }
+  const usable = usableReasoningEfforts(efforts)
+  if (!usable) return { applied: false }
+  return { applied: true, efforts: usable }
 }
 
 export function modelProfileOf(entry, options = {}) {
-  const id = nonEmptyString(entry?.slug, entry?.id, entry?.model)
+  const id = modelIdOf(entry)
   if (!id || (!options.includeHiddenModels && entry?.visibility === 'hide')) return undefined
   if (isExcludedModel(id, options.excludedModels)) return undefined
   const override = modelOverrideOf(options, id)
@@ -163,6 +174,7 @@ export function modelProfileOf(entry, options = {}) {
     entry?.inputTokenLimit,
     entry?.max_input_tokens,
     options.defaultContextWindow,
+    DEFAULT_CONTEXT_WINDOW,
   )
   const explicitMaxTokens = positiveInteger(override?.maxTokens)
   let maxTokens = explicitMaxTokens ?? positiveInteger(
@@ -171,6 +183,7 @@ export function modelProfileOf(entry, options = {}) {
     entry?.outputTokenLimit,
     entry?.max_tokens,
     options.defaultMaxTokens,
+    DEFAULT_MAX_TOKENS,
   )
   if (
     explicitMaxTokens === undefined
@@ -197,7 +210,7 @@ export function modelProfileOf(entry, options = {}) {
     ),
     contextWindow,
     maxTokens,
-    input: overrideInputModalities(override?.input) ?? inputModalitiesOf(entry, options.defaultInput ?? ['text']),
+    input: overrideInputModalities(override?.input) ?? inputModalitiesOf(entry, options.defaultInput ?? DEFAULT_INPUT),
     ...(reasoningEfforts ? { reasoningEfforts } : {}),
   }
 }
@@ -223,18 +236,18 @@ export function mergeCatalogPayloads(primaryBody, supplementBody) {
   if (!supplement) return primaryBody
   const supplements = new Map()
   for (const entry of supplement) {
-    const id = nonEmptyString(entry?.slug, entry?.id, entry?.model)
+    const id = modelIdOf(entry)
     if (id !== undefined && !supplements.has(id)) supplements.set(id, entry)
   }
   const models = primary.map((entry) => {
-    const id = nonEmptyString(entry?.slug, entry?.id, entry?.model)
+    const id = modelIdOf(entry)
     const extra = id === undefined ? undefined : supplements.get(id)
     return extra === undefined ? entry : mergedEntryOf(entry, extra)
   })
   return { ...primaryBody, models }
 }
 
-export function readCodexCatalog(body, options = {}) {
+export function readCatalog(body, options = {}) {
   const entries = catalogEntriesOf(body)
   if (!entries) throw new TypeError('CLIProxyAPI model catalog has no "models" or "data" array')
   const models = []
@@ -249,8 +262,14 @@ export function readCodexCatalog(body, options = {}) {
   return models
 }
 
+export const readCodexCatalog = readCatalog
+
+export function trimBaseURL(baseURL) {
+  return String(baseURL ?? '').trim().replace(/\/+$/, '')
+}
+
 function catalogBase(baseURL) {
-  const base = String(baseURL ?? '').trim().replace(/\/+$/, '')
+  const base = trimBaseURL(baseURL)
   if (!base) throw new TypeError('CLIProxyAPI baseURL must not be empty')
   return base
 }

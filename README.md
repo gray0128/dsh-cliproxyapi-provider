@@ -68,7 +68,7 @@ npx @deepseek-ai/dsh plugin --profile web remove @gray0128/dsh-cliproxyapi-provi
 
 ## 故障排查
 
-- **提示“与 DSH 不兼容”**：插件版本与当前 DSH 不匹配。请升级插件，不要用 `dsh plugin allow-version` 豁免——本插件依赖 0.2.1-rc.3 的宿主 API，绕过检查后仍会在加载时失败。
+- **提示「与 DSH 不兼容」**：插件版本与当前 DSH 不匹配。请升级插件，不要用 `dsh plugin allow-version` 豁免——本插件依赖 0.2.1-rc.3 的宿主 API，绕过检查后仍会在加载时失败。
 - **返回 401 或 403**：在设置中保存有效的 API 密钥。
 - **保存后模型列表为空**：确认 CLIProxyAPI 的 `/models` 返回 Codex 风格的 `models` 数组或标准 OpenAI 风格的 `data` 数组，且至少包含一个未被 `excludedModels` 过滤的可用模型。
 

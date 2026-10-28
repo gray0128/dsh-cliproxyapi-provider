@@ -251,8 +251,7 @@ test('falls back to the standard catalog when the Codex catalog fails', async ()
     const models = await harness.discoveries.get('llm-cliproxyapi')({
       provider: 'CLIProxyAPI',
       baseURL: 'http://127.0.0.1:8317/v1',
-      signal: new AbortController().signal,
-    })
+    }, new AbortController().signal)
     assert.deepEqual(models, [
       {
         id: 'gemini-3-pro',
@@ -270,6 +269,50 @@ test('falls back to the standard catalog when the Codex catalog fails', async ()
         reasoningEfforts: { low: 'low', high: 'high', off: 'none' },
       },
     ])
+    harness.dispose()
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('degrades to the responding catalog when one endpoint times out or filters to empty', async () => {
+  const previousFetch = globalThis.fetch
+  let mode = 'standard-timeout'
+  globalThis.fetch = async (url, options) => {
+    const isCodex = String(url).includes('client_version=')
+    if (mode === 'standard-timeout' && !isCodex) {
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+      })
+    }
+    if (isCodex) {
+      return new Response(JSON.stringify({ models: [
+        { slug: 'hidden-only', visibility: 'hide', max_context_window: 128000 },
+        ...(mode === 'standard-timeout' ? [{ slug: 'codex-ok', max_context_window: 200000 }] : []),
+      ] }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ object: 'list', data: [
+      { id: 'standard-ok', context_length: 128000, max_completion_tokens: 16384 },
+    ] }), { status: 200 })
+  }
+  try {
+    const harness = createContext({ providers: {} })
+    apply(harness.ctx, await resolvedConfig({ fetchTimeoutMs: 15 }))
+    const discover = harness.discoveries.get('llm-cliproxyapi')
+
+    const fromCodex = await discover(
+      { provider: 'CLIProxyAPI', baseURL: 'http://127.0.0.1:8317/v1' },
+      new AbortController().signal,
+    )
+    assert.deepEqual(fromCodex.map((model) => model.id), ['codex-ok'])
+
+    mode = 'codex-filtered-empty'
+    const fromStandard = await discover(
+      { provider: 'CLIProxyAPI', baseURL: 'http://127.0.0.1:8317/v1' },
+      new AbortController().signal,
+    )
+    assert.deepEqual(fromStandard.map((model) => model.id), ['standard-ok'])
+    assert.equal(fromStandard[0].maxTokens, 16384)
     harness.dispose()
   } finally {
     globalThis.fetch = previousFetch
@@ -675,9 +718,9 @@ test('real Cordis composition leaves llm-pi-ai as the sole directory owner', asy
     const discovered = await ctx.llm.discoverModels('llm-cliproxyapi', {
       provider: 'CLIProxyAPI',
       baseURL: 'http://127.0.0.1:8317/v1',
-      signal: new AbortController().signal,
-    })
+    }, new AbortController().signal)
     assert.equal(discovered[0].input, undefined)
+    assert.deepEqual(discovered[0].inputModalities, ['text'])
     assert.equal(discovered[1].reasoningEfforts, undefined)
     await ctx.settings.mutate('llm-pi-ai', [{
       op: 'set',

@@ -200,21 +200,31 @@ window.__ModuleLoader__.load({
         || String(Date.now()) + '-' + Math.random().toString(36).slice(2)
     }
 
+    function bootstrapModalitiesOf(model) {
+      const candidate = Array.isArray(model.input) && model.input.length
+        ? model.input
+        : model.inputModalities
+      return Array.isArray(candidate) && candidate.length ? [...candidate] : undefined
+    }
+
     function bootstrapProfileOf(baseURL, models, hasCredential, syncToken) {
       return {
         displayName: PROVIDER,
         api: 'openai-responses',
         baseURL,
-        models: models.map((model) => ({
-          id: model.id,
-          name: model.name || model.id,
-          contextWindow: model.contextWindow || 262144,
-          maxTokens: model.maxTokens || 32768,
-          ...(Array.isArray(model.input) && model.input.length ? { input: model.input } : {}),
-          ...(model.reasoningEfforts && Object.keys(model.reasoningEfforts).length
-            ? { reasoningEfforts: model.reasoningEfforts }
-            : {}),
-        })),
+        models: models.map((model) => {
+          const input = bootstrapModalitiesOf(model)
+          return {
+            id: model.id,
+            name: model.name || model.id,
+            contextWindow: model.contextWindow || 262144,
+            maxTokens: model.maxTokens || 32768,
+            ...(input ? { input } : {}),
+            ...(model.reasoningEfforts && Object.keys(model.reasoningEfforts).length
+              ? { reasoningEfforts: model.reasoningEfforts }
+              : {}),
+          }
+        }),
         defaultContextWindow: 262144,
         defaultMaxTokens: 32768,
         defaultInput: ['text'],
