@@ -762,3 +762,179 @@ test('real Cordis composition leaves llm-pi-ai as the sole directory owner', asy
     for (const fiber of fibers.reverse()) await fiber.dispose().catch(() => {})
   }
 })
+
+test('calibrates incomplete or synthetic CLIProxyAPI entries from prioritized metadata sources and writes mutable profiles', async () => {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const target = String(url)
+    if (target.includes('openrouter.test')) {
+      return new Response(JSON.stringify({
+        data: [{
+          id: 'custom-vendor/openrouter-calibrated',
+          context_length: 256000,
+          top_provider: { max_completion_tokens: 64000 },
+          architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+          reasoning: { supported_efforts: ['low', 'medium', 'high'] },
+        }],
+      }), { status: 200 })
+    }
+    if (target.includes('litellm.test')) {
+      return new Response(JSON.stringify({}), { status: 200 })
+    }
+    if (target.includes('client_version=')) {
+      return new Response(JSON.stringify({
+        models: [
+          {
+            slug: 'claude-opus-5-5-high',
+            display_name: 'Claude Opus 5.5 (High)',
+            context_window: 1000000,
+            max_context_window: 1000000,
+            max_tokens: 128000,
+            input_modalities: ['text', 'image'],
+            supported_reasoning_levels: [],
+          },
+          {
+            slug: 'claude-sonnet-4-5-intl',
+            display_name: 'claude-sonnet-4-5-intl',
+            context_window: 500000,
+            max_context_window: 872000,
+            input_modalities: ['text', 'image'],
+            supported_reasoning_levels: [
+              { effort: 'low' },
+              { effort: 'medium' },
+              { effort: 'high' },
+              { effort: 'xhigh' },
+              { effort: 'max' },
+              { effort: 'ultra' },
+            ],
+          },
+          {
+            slug: 'openrouter-calibrated',
+            display_name: 'OpenRouter Calibrated',
+            context_window: 500000,
+            max_context_window: 872000,
+            input_modalities: ['text'],
+            supported_reasoning_levels: [
+              { effort: 'low' },
+              { effort: 'medium' },
+              { effort: 'high' },
+              { effort: 'xhigh' },
+              { effort: 'max' },
+              { effort: 'ultra' },
+            ],
+          },
+        ],
+      }), { status: 200 })
+    }
+    return new Response(JSON.stringify({
+      object: 'list',
+      data: [
+        { id: 'claude-opus-5-5-high', object: 'model' },
+        { id: 'claude-sonnet-4-5-intl', object: 'model' },
+        { id: 'openrouter-calibrated', object: 'model' },
+      ],
+    }), { status: 200 })
+  }
+
+  try {
+    const harness = createContext({ providers: {} })
+    apply(harness.ctx, await resolvedConfig({
+      openRouterModelsURL: 'https://openrouter.test/api/v1/models',
+      liteLlmModelsURL: 'https://litellm.test/models.json',
+    }))
+
+    const discovered = await harness.discoveries.get('llm-cliproxyapi')({
+      provider: 'CLIProxyAPI',
+      baseURL: 'http://127.0.0.1:8317/v1',
+      signal: new AbortController().signal,
+    })
+
+    assert.deepEqual(discovered[0], {
+      id: 'claude-opus-5-5-high',
+      name: 'Claude Opus 5.5 (High)',
+      contextWindow: 1000000,
+      maxTokens: 128000,
+      input: ['text', 'image'],
+      reasoningEfforts: {
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        xhigh: 'xhigh',
+        max: 'max',
+      },
+    })
+    assert.deepEqual(discovered[1], {
+      id: 'claude-sonnet-4-5-intl',
+      name: 'claude-sonnet-4-5-intl',
+      contextWindow: 200000,
+      maxTokens: 64000,
+      input: ['text', 'image'],
+      reasoningEfforts: {
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        xhigh: 'xhigh',
+        max: 'max',
+      },
+    })
+    assert.deepEqual(discovered[2], {
+      id: 'openrouter-calibrated',
+      name: 'OpenRouter Calibrated',
+      contextWindow: 256000,
+      maxTokens: 64000,
+      input: ['text', 'image'],
+      reasoningEfforts: {
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+      },
+    })
+
+    const strippedBootstrap = discovered.map(({ id, name, contextWindow, maxTokens }) => ({
+      id,
+      name,
+      contextWindow,
+      maxTokens,
+    }))
+    harness.setSection({
+      providers: {
+        CLIProxyAPI: managedProfile({
+          models: strippedBootstrap,
+          headers: {
+            [PROFILE_SYNC_HEADER]: 'rich:1',
+            authorization: PLACEHOLDER_AUTHORIZATION,
+          },
+        }),
+      },
+    })
+    harness.emit('settings/document-updated', 'llm-pi-ai')
+    await waitFor(() => harness.mutations.length === 1)
+
+    const synced = harness.mutations[0][0].value
+    assert.equal(Object.isFrozen(synced), false)
+    assert.equal(Object.isFrozen(synced.models[0]), false)
+    assert.equal(Object.getPrototypeOf(synced.headers), Object.prototype)
+    assert.equal(Object.getPrototypeOf(synced.models[0].reasoningEfforts), Object.prototype)
+
+    // Re-saving a profile with a new sync header must re-trigger synchronization
+    // even if models already match the previous persisted models.
+    harness.setSection({
+      providers: {
+        CLIProxyAPI: {
+          ...synced,
+          headers: {
+            ...synced.headers,
+            [PROFILE_SYNC_HEADER]: 'model-ids:2',
+          },
+        },
+      },
+    })
+    harness.emit('settings/document-updated', 'llm-pi-ai')
+    await waitFor(() => harness.mutations.length === 2)
+    assert.equal(harness.mutations[1][0].value.headers[PROFILE_SYNC_HEADER], undefined)
+
+    harness.dispose()
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})

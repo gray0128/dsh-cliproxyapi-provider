@@ -11,6 +11,16 @@ import {
   standardCatalogURL,
   trimBaseURL,
 } from './catalog.js'
+import {
+  DEFAULT_LITELLM_MODELS_URL,
+  DEFAULT_METADATA_CACHE_TTL_MS,
+  DEFAULT_METADATA_SOURCES,
+  DEFAULT_METADATA_TIMEOUT_MS,
+  DEFAULT_OPENROUTER_MODELS_URL,
+  METADATA_SOURCE_IDS,
+  calibrateCatalogPayload,
+  createMetadataResolver,
+} from './metadata.js'
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024
 const DISCOVERY_HANDOFF_TTL_MS = 60000
@@ -40,6 +50,11 @@ export const Config = z.object({
   defaultInput: z.array(z.union(['text', 'image'])).default(['text']),
   excludedModels: z.array(z.string()).default([]),
   modelOverrides: z.dict(ModelOverrideSchema).default({}),
+  metadataSources: z.array(z.union(METADATA_SOURCE_IDS)).default([...DEFAULT_METADATA_SOURCES]),
+  openRouterModelsURL: z.string().default(DEFAULT_OPENROUTER_MODELS_URL),
+  liteLlmModelsURL: z.string().default(DEFAULT_LITELLM_MODELS_URL),
+  metadataTimeoutMs: z.number().step(1).min(1).default(DEFAULT_METADATA_TIMEOUT_MS),
+  metadataCacheTtlMs: z.number().step(1).min(0).default(DEFAULT_METADATA_CACHE_TTL_MS),
   headers: z.dict(z.string()).default({}),
   fetchTimeoutMs: z.number().step(1).min(1).default(15000),
   retryInitialMs: z.number().step(1).min(1).default(3000),
@@ -221,7 +236,7 @@ function readCatalogError(error) {
   )
 }
 
-function resolveCatalogModels(primary, standard, options) {
+async function resolveCatalogModels(primary, standard, options, metadataResolver, parentSignal) {
   const candidates = []
   if (primary.status === 'fulfilled' && hasCatalogEntries(primary.value)) {
     candidates.push(
@@ -235,8 +250,17 @@ function resolveCatalogModels(primary, standard, options) {
   }
   let lastError
   for (const body of candidates) {
+    let calibrated = body
+    if (metadataResolver) {
+      try {
+        const indexes = await metadataResolver.resolveIndexesForPayloads([body], parentSignal)
+        if (indexes.length) calibrated = calibrateCatalogPayload(body, indexes)
+      } catch {
+        calibrated = body
+      }
+    }
     try {
-      return readCatalog(body, options)
+      return readCatalog(calibrated, options)
     } catch (error) {
       lastError = error
     }
@@ -253,7 +277,7 @@ function resolveCatalogModels(primary, standard, options) {
   throw standard.reason
 }
 
-async function discoverCatalog(ctx, options, suppliedApiKey, parentSignal) {
+async function discoverCatalog(ctx, options, suppliedApiKey, parentSignal, metadataResolver) {
   const apiKey = await optionalApiKey(ctx, suppliedApiKey)
   const baseURL = normalizedBaseURL(options.baseURL)
   const primaryURL = catalogURL(baseURL)
@@ -268,8 +292,12 @@ async function discoverCatalog(ctx, options, suppliedApiKey, parentSignal) {
   if (parentSignal?.aborted) {
     throw parentSignal.reason ?? new Error('CLIProxyAPI model catalog request was aborted')
   }
+  const models = await resolveCatalogModels(primary, standard, options, metadataResolver, parentSignal)
+  if (parentSignal?.aborted) {
+    throw parentSignal.reason ?? new Error('CLIProxyAPI model catalog request was aborted')
+  }
   return {
-    models: resolveCatalogModels(primary, standard, options),
+    models,
     hasApiKey: apiKey !== undefined,
   }
 }
@@ -292,6 +320,8 @@ function refreshKeyOf(profile, config) {
     defaultInput: profile.defaultInput,
     excludedModels: config.excludedModels,
     modelOverrides: config.modelOverrides,
+    metadataSources: config.metadataSources,
+    sync: profileSyncValue(profile),
     headers: sortedHeaders(catalogHeadersOf(profile.headers, config.headers)),
   })
 }
@@ -320,11 +350,13 @@ async function profileOf(profile, models, hasApiKey, config) {
   }
   // llm-pi-ai marks `providers` volatile, and schemastery wraps a volatile
   // dict in a holder that exposes the resolved object through `get()`.
+  // Clone the resolved entry so downstream settings validation receives
+  // mutable plain objects instead of frozen null-prototype dictionaries.
   const providers = validated.value.providers
   const resolved = typeof providers?.get === 'function' && !Object.hasOwn(providers, PROVIDER)
     ? providers.get()
     : providers
-  return resolved?.[PROVIDER]
+  return resolved?.[PROVIDER] === undefined ? undefined : structuredClone(resolved[PROVIDER])
 }
 
 function retryDelay(config, failures) {
@@ -339,12 +371,14 @@ export function apply(ctx, config) {
   if (!config.defaultInput.length) throw new Error('defaultInput must contain at least one modality')
   if (config.retryMaxMs < config.retryInitialMs) throw new Error('retryMaxMs must be greater than or equal to retryInitialMs')
 
+  const metadataResolver = createMetadataResolver(config)
+
   const catalogFor = (profile, signal) => discoverCatalog(ctx, {
     ...catalogConfigOf(config),
     baseURL: profile.baseURL,
     headers: catalogHeadersOf(profile.headers, config.headers),
     fetchTimeoutMs: config.fetchTimeoutMs,
-  }, undefined, signal)
+  }, undefined, signal, metadataResolver)
 
   const discoveryHandoffs = new Map()
 
@@ -362,12 +396,19 @@ export function apply(ctx, config) {
     })
   }
 
-  const takeDiscovery = (baseURL) => {
+  const peekDiscovery = (baseURL) => {
     const key = normalizedBaseURL(baseURL)
     const handoff = discoveryHandoffs.get(key)
-    discoveryHandoffs.delete(key)
-    if (!handoff || Date.now() - handoff.storedAt > DISCOVERY_HANDOFF_TTL_MS) return undefined
-    return handoff.models
+    if (!handoff) return undefined
+    if (Date.now() - handoff.storedAt > DISCOVERY_HANDOFF_TTL_MS) {
+      discoveryHandoffs.delete(key)
+      return undefined
+    }
+    return structuredClone(handoff.models)
+  }
+
+  const clearDiscovery = (baseURL) => {
+    discoveryHandoffs.delete(normalizedBaseURL(baseURL))
   }
 
   ctx.llm.registerModelDiscovery(DISCOVERY_NS, async (request, signal) => {
@@ -376,7 +417,7 @@ export function apply(ctx, config) {
       baseURL: request.baseURL,
       headers: config.headers,
       fetchTimeoutMs: config.fetchTimeoutMs,
-    }, request.apiKey, signal ?? request?.signal)
+    }, request.apiKey, signal ?? request?.signal, metadataResolver)
     rememberDiscovery(request.baseURL, catalog.models)
     return catalog.models.map((model) => Object.defineProperty({ ...model }, 'inputModalities', {
       value: model.input,
@@ -395,13 +436,17 @@ export function apply(ctx, config) {
     if (signal.aborted) throw signal.reason
     const hasApiKey = async () => (await optionalApiKey(ctx)) !== undefined
     let catalog
+    let usedHandoff = false
     if (authOnly) {
       catalog = { models: profile.models, hasApiKey: await hasApiKey() }
     } else if (profileHasRichBootstrap(profile)) {
-      const discovered = takeDiscovery(profile.baseURL)
-      catalog = discovered
-        ? { models: discovered, hasApiKey: await hasApiKey() }
-        : await catalogFor(profile, signal)
+      const discovered = peekDiscovery(profile.baseURL)
+      if (discovered) {
+        usedHandoff = true
+        catalog = { models: discovered, hasApiKey: await hasApiKey() }
+      } else {
+        catalog = await catalogFor(profile, signal)
+      }
     } else {
       catalog = await catalogFor(profile, signal)
     }
@@ -415,6 +460,7 @@ export function apply(ctx, config) {
         value: next,
       }], piAiEntryOf(ctx)?.revision)
     }
+    if (usedHandoff) clearDiscovery(profile.baseURL)
     return true
   }
 
