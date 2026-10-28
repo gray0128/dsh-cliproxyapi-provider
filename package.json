@@ -64,6 +64,9 @@
     "@deepseek-ai/schemastery": "3.18.5"
   },
   "engines": { "node": ">=22", "dsh": ">=0.2.1-rc.3 <0.2.2-0" },
-  "license": "MIT",
-  "private": true
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "license": "MIT"
 }
