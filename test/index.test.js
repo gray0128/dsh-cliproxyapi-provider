@@ -9,7 +9,6 @@ import {
   inject as piAiInject,
   name as piAiName,
 } from '@deepseek-ai/dsh-llm-pi-ai'
-import { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import {
   Config,
   PLACEHOLDER_AUTHORIZATION,
@@ -39,6 +38,7 @@ function managedProfile(overrides = {}) {
 
 function createContext(initialSection, initialCredential) {
   let section = initialSection
+  let revision = 1
   let credential = initialCredential
   const discoveries = new Map()
   const listeners = new Map()
@@ -58,8 +58,8 @@ function createContext(initialSection, initialCredential) {
       },
     },
     settings: {
-      get() {
-        return section
+      describe() {
+        return section === undefined ? [] : [{ ns: 'llm-pi-ai', value: section, revision }]
       },
       async mutate(_ns, ops) {
         mutations.push(ops)
@@ -70,6 +70,7 @@ function createContext(initialSection, initialCredential) {
           else delete providers[op.path[1]]
         }
         section = { ...section, providers }
+        revision += 1
       },
     },
     credentials: {
@@ -220,7 +221,7 @@ test('first profile synchronization restores capabilities stripped by the browse
         },
       }),
     } })
-    harness.emit('settings/updated', 'llm-pi-ai', harness.section, undefined, 'update')
+    harness.emit('settings/document-updated', 'llm-pi-ai')
 
     await waitFor(() => harness.mutations.length === 1)
     const profile = harness.mutations[0][0].value
@@ -235,7 +236,7 @@ test('first profile synchronization restores capabilities stripped by the browse
       reasoningEfforts: {
         low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max',
       },
-      compat: { chatTemplateKwargs: {} },
+      compat: { chatTemplateKwargs: {}, chatTemplateArgs: {} },
     })
     assert.deepEqual(profile.models[1].input, ['text'])
     await waitFor(() => harness.timeouts.some((row) => row.delay === 300000))
@@ -306,7 +307,7 @@ test('keyless profiles omit apiKeyEnv and receive a non-sensitive placeholder he
     assert.equal(profile.apiKeyEnv, undefined)
     assert.equal(profile.headers.authorization, PLACEHOLDER_AUTHORIZATION)
     assert.equal(profile.models[0].id, 'model-a')
-    harness.emit('settings/updated', 'llm-pi-ai', harness.section, undefined, 'update')
+    harness.emit('settings/document-updated', 'llm-pi-ai')
     await new Promise((resolve) => setTimeout(resolve, 25))
     assert.equal(harness.mutations.length, 1)
     assert.equal(fetches, 1)
@@ -389,7 +390,7 @@ test('a newer settings change aborts stale discovery and only installs the lates
     harness.setSection({ providers: {
       CLIProxyAPI: managedProfile({ baseURL: 'http://127.0.0.1:9417/v1' }),
     } })
-    harness.emit('settings/updated', 'llm-pi-ai', harness.section, undefined, 'update')
+    harness.emit('settings/document-updated', 'llm-pi-ai')
     await waitFor(() => harness.mutations.length === 1)
     const profile = harness.mutations[0][0].value
     assert.equal(profile.baseURL, 'http://127.0.0.1:9417/v1')
@@ -432,11 +433,34 @@ test('real Cordis composition leaves llm-pi-ai as the sole directory owner', asy
       providers: {},
     },
   }
+  const revisions = { 'llm-pi-ai': 1 }
 
-  class MemorySettings extends SettingsProvider {
-    writable = true
-    async load() { return structuredClone(document) }
-    async persist(ns, section) { document[ns] = structuredClone(section) }
+  class MemorySettings extends Service {
+    constructor(ctx) {
+      super(ctx, 'settings')
+    }
+    describe() {
+      return Object.entries(document).map(([ns, value]) => ({
+        ns,
+        value: structuredClone(value),
+        revision: revisions[ns],
+      }))
+    }
+    async mutate(ns, ops, expectedRevision) {
+      if (expectedRevision !== undefined && expectedRevision !== revisions[ns]) {
+        throw new Error(`settings namespace "${ns}" moved past the expected revision`)
+      }
+      const next = structuredClone(document[ns] ?? {})
+      for (const op of ops) {
+        assert.equal(op.path[0], 'providers')
+        next.providers = { ...(next.providers || {}), [op.path[1]]: structuredClone(op.value) }
+      }
+      document[ns] = next
+      revisions[ns] += 1
+      this.ctx.emit('settings/document-updated', ns, revisions[ns])
+      this.onPersist?.(ns, structuredClone(next))
+      return { ns, value: structuredClone(next), revision: revisions[ns] }
+    }
   }
 
   class MemoryCredentials extends CredentialProvider {
@@ -500,6 +524,12 @@ test('real Cordis composition leaves llm-pi-ai as the sole directory owner', asy
     fibers.push(piFiber, cpaFiber)
     await Promise.all([piFiber.await(), cpaFiber.await()])
 
+    // Stand in for the host config editor: a persisted settings section
+    // reaches llm-pi-ai as a fresh plugin config.
+    ctx.settings.onPersist = (ns, value) => {
+      if (ns === 'llm-pi-ai') piFiber.update({ providers: value.providers })
+    }
+
     const discovered = await ctx.llm.discoverModels('llm-cliproxyapi', {
       provider: 'CLIProxyAPI',
       baseURL: 'http://127.0.0.1:8317/v1',
@@ -519,14 +549,14 @@ test('real Cordis composition leaves llm-pi-ai as the sole directory owner', asy
       }),
     }])
 
-    await waitFor(() => ctx.settings.get('llm-pi-ai')?.providers?.CLIProxyAPI?.models?.[0]?.id === 'plain')
-    await waitFor(() => ctx.settings.get('llm-pi-ai').providers.CLIProxyAPI.headers[PROFILE_SYNC_HEADER] === undefined)
+    await waitFor(() => document['llm-pi-ai']?.providers?.CLIProxyAPI?.models?.[0]?.id === 'plain')
+    await waitFor(() => document['llm-pi-ai'].providers.CLIProxyAPI.headers[PROFILE_SYNC_HEADER] === undefined)
     assert.equal(catalogFetches, 1)
     const directories = ctx.llm.listConfigurableProviders().filter((entry) => entry.provider === 'CLIProxyAPI')
     assert.equal(directories.length, 1)
     assert.equal(directories[0].settingsNs, 'llm-pi-ai')
     assert.equal(ctx.llm.listProviders().some((provider) => provider.id === 'CLIProxyAPI'), true)
-    const models = ctx.settings.get('llm-pi-ai').providers.CLIProxyAPI.models
+    const models = document['llm-pi-ai'].providers.CLIProxyAPI.models
     assert.equal(models[0].reasoningEfforts, undefined)
     assert.deepEqual(models[1].reasoningEfforts, { off: 'none', high: 'high' })
 

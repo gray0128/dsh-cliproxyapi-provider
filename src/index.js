@@ -2,14 +2,14 @@ import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assertUsableApiKey, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { Config as PiAiConfig } from '@deepseek-ai/dsh-llm-pi-ai'
-import { deepEqualJson, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import { catalogURL, readCodexCatalog } from './catalog.js'
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024
 const DISCOVERY_HANDOFF_TTL_MS = 60000
 const MAX_DISCOVERY_HANDOFFS = 8
-const DISCOVERY_NS = settingsNamespace('llm-cliproxyapi')
-const PI_NS = settingsNamespace('llm-pi-ai')
+const DISCOVERY_NS = 'llm-cliproxyapi'
+const PI_NS = 'llm-pi-ai'
 const API_KEY_REF = credentialRef('DSH_CLIPROXY_API_KEY')
 const PROVIDER = 'CLIProxyAPI'
 
@@ -235,11 +235,21 @@ async function profileOf(profile, models, hasApiKey, config) {
   if (validated.issues?.length) {
     throw new Error(`llm-pi-ai rejected the generated provider profile: ${validated.issues[0].message}`)
   }
-  return validated.value.providers[PROVIDER]
+  // llm-pi-ai marks `providers` volatile, and schemastery wraps a volatile
+  // dict in a holder that exposes the resolved object through `get()`.
+  const providers = validated.value.providers
+  const resolved = typeof providers?.get === 'function' && !Object.hasOwn(providers, PROVIDER)
+    ? providers.get()
+    : providers
+  return resolved?.[PROVIDER]
 }
 
 function retryDelay(config, failures) {
   return Math.min(config.retryInitialMs * (2 ** Math.max(0, failures - 1)), config.retryMaxMs)
+}
+
+function piAiEntryOf(ctx) {
+  return ctx.settings.describe().find((entry) => entry.ns === PI_NS)
 }
 
 export function apply(ctx, config) {
@@ -295,9 +305,9 @@ export function apply(ctx, config) {
   let observedRefreshKey
 
   const synchronize = async (signal, authOnly = false) => {
-    const section = ctx.settings.get(PI_NS)
-    if (section === undefined) throw new Error('The built-in llm-pi-ai settings namespace is not ready')
-    const profile = section.providers?.[PROVIDER]
+    const entry = piAiEntryOf(ctx)
+    if (entry === undefined) throw new Error('The built-in llm-pi-ai settings entry is not ready')
+    const profile = entry.value?.providers?.[PROVIDER]
     if (!profile) return false
     if (authOnly && profileSynchronizationPending(profile)) return true
     if (signal.aborted) throw signal.reason
@@ -321,7 +331,7 @@ export function apply(ctx, config) {
         op: 'set',
         path: ['providers', PROVIDER],
         value: next,
-      }])
+      }], piAiEntryOf(ctx)?.revision)
     }
     return true
   }
@@ -396,14 +406,14 @@ export function apply(ctx, config) {
   }
 
   const scheduleFromSettings = (force = false) => {
-    const profile = ctx.settings.get(PI_NS)?.providers?.[PROVIDER]
+    const profile = piAiEntryOf(ctx)?.value?.providers?.[PROVIDER]
     const refreshKey = refreshKeyOf(profile, config)
     if (!force && refreshKey === observedRefreshKey) return
     observedRefreshKey = refreshKey
     schedule()
   }
 
-  ctx.on('settings/updated', (ns) => {
+  ctx.on('settings/document-updated', (ns) => {
     if (ns === PI_NS) scheduleFromSettings()
   })
   ctx.on('credentials/reference-updated', (ref) => {

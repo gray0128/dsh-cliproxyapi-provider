@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
     const SETTINGS_SLOT = 'settings.plugins.tab'
     const SETTINGS_TAB_ID = 'cliproxyapi'
     const SETTINGS_LOCALE_NS = 'settings.cliProxyApi'
-    const inject = ['connection', 'remote', 'slots', 'locale', 'settingsScope']
+    const inject = ['remote', 'slots', 'locale']
 
     const copy = {
       en: {
@@ -166,13 +166,13 @@ window.__ModuleLoader__.load({
     }
 
     function unwrap(response) {
-      if (!response || !response.result || !response.result.ok) {
-        const message = response && response.result && response.result.error
-          ? response.result.error.message
+      if (!response || !response.ok) {
+        const message = response && response.error
+          ? response.error.message
           : 'Harness request failed'
         throw new Error(message)
       }
-      return response.result.value
+      return response.value
     }
 
     function validBaseURL(value, messages) {
@@ -266,33 +266,29 @@ window.__ModuleLoader__.load({
     }
 
     async function installInitialProfile(api, scope, baseURL, apiKey, messages) {
-      const described = unwrap(await api.settings.describe({}))
+      const described = unwrap(await api.settings.describe())
       const namespace = described.namespaces.find((entry) => entry.ns === PI_NS)
-      if (!namespace) throw new Error('The llm-pi-ai settings namespace is unavailable')
+      if (!namespace) throw new Error('The llm-pi-ai settings entry is unavailable')
 
-      const credentialResult = unwrap(await api.credentials.describe({ refs: [CREDENTIAL_REF] }))
-      const credential = credentialResult.credentials[CREDENTIAL_REF] || { configured: false }
-      const discovered = unwrap(await api.llm.discoverModels({
-        settingsNs: DISCOVERY_NS,
+      const credentialResult = unwrap(await api.credentials.describe([CREDENTIAL_REF]))
+      const credential = credentialResult[CREDENTIAL_REF] || { configured: false }
+      const discovered = unwrap(await api.llm.discoverModels(DISCOVERY_NS, {
         provider: PROVIDER,
         baseURL,
         api: 'openai-responses',
         ...(apiKey ? { apiKey } : {}),
-      })).models
+      }))
       if (!discovered.length) throw new Error(messages.noModels)
 
-      if (apiKey) unwrap(await api.credentials.set({ ref: CREDENTIAL_REF, value: apiKey }))
+      if (apiKey) unwrap(await api.credentials.set(CREDENTIAL_REF, apiKey))
       const hasCredential = Boolean(apiKey || credential.configured)
       const syncToken = createSyncToken()
-      const updated = unwrap(await api.settings.mutate({
-        ns: PI_NS,
-        ops: [{
-          op: 'set',
-          path: ['providers', PROVIDER],
-          value: bootstrapProfileOf(baseURL, discovered, hasCredential, syncToken),
-        }],
-        ...(Number.isInteger(namespace.revision) ? { expectedRevision: namespace.revision } : {}),
-      }))
+      const expectedRevision = namespace.revision
+      const updated = unwrap(await api.settings.mutate(PI_NS, [{
+        op: 'set',
+        path: ['providers', PROVIDER],
+        value: bootstrapProfileOf(baseURL, discovered, hasCredential, syncToken),
+      }], expectedRevision))
       return waitForProfileSynchronization(scope, baseURL, updated, messages)
     }
 
@@ -315,8 +311,8 @@ window.__ModuleLoader__.load({
 
     async function credentialStatusOf(api) {
       try {
-        const described = unwrap(await api.credentials.describe({ refs: [CREDENTIAL_REF] }))
-        return described.credentials[CREDENTIAL_REF]?.configured === true
+        const described = unwrap(await api.credentials.describe([CREDENTIAL_REF]))
+        return described[CREDENTIAL_REF]?.configured === true
           ? 'configured'
           : 'missing'
       } catch {
@@ -477,27 +473,86 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function createSettingsScope(ctx, remote, namespace) {
+      const listeners = new Set()
+      const disposers = []
+      let snapshot = { status: 'loading', value: undefined, revision: undefined, writable: false }
+      let disposed = false
+      let loading = false
+
+      const publish = (next) => {
+        if (disposed) return
+        snapshot = next
+        for (const listener of [...listeners]) listener()
+      }
+
+      const refresh = async () => {
+        if (disposed || loading) return
+        loading = true
+        try {
+          const response = await remote.settings.describe()
+          if (disposed) return
+          if (!response || !response.ok) throw new Error(response?.error?.message ?? 'settings describe failed')
+          const view = response.value
+          const row = Array.isArray(view?.namespaces)
+            ? view.namespaces.find((entry) => entry.ns === namespace)
+            : undefined
+          publish(row === undefined
+            ? { status: 'unavailable', value: undefined, revision: undefined, writable: false }
+            : { status: 'ready', value: row.value, revision: row.revision, writable: view.writable === true })
+        } catch {
+          if (!disposed && snapshot.status === 'loading') {
+            publish({ status: 'unavailable', value: undefined, revision: undefined, writable: false })
+          }
+        } finally {
+          loading = false
+        }
+      }
+
+      disposers.push(remote.$on('settings/document-updated', () => { void refresh() }))
+      if (typeof ctx.on === 'function') {
+        disposers.push(ctx.on('connection/reset', () => { void refresh() }))
+      }
+      void refresh()
+
+      return {
+        getSnapshot() { return snapshot },
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        refresh,
+        dispose() {
+          disposed = true
+          listeners.clear()
+          for (const dispose of disposers.splice(0)) dispose?.()
+        },
+      }
+    }
+
     function apply(ctx) {
-      const api = ctx.get('connection').api
-      const remote = ctx.get('remote')
       const locale = ctx.locale
-      const settingsScope = ctx.settingsScope
       const t = locale.bind(SETTINGS_LOCALE_NS)
-      const scope = settingsScope.bind({ namespace: PI_NS })
 
       ctx.effect(
         () => locale.register(SETTINGS_LOCALE_NS, copy),
         'dsh-provider-cpa: dictionaries',
       )
 
-      ctx.slots.inject(SETTINGS_SLOT, () => ctx.slots.register({
-        name: SETTINGS_SLOT,
-        id: SETTINGS_TAB_ID,
-        order: 30,
-        label: () => t('tab'),
-        locale: SETTINGS_LOCALE_NS,
-        inject: () => ({ api, remote, scope }),
-      }, SettingsTab))
+      ctx.inject(['remote', 'remote.settings', 'remote.credentials', 'remote.llm'], (scoped) => {
+        const remote = scoped.remote
+        const scope = createSettingsScope(scoped, remote, PI_NS)
+        scoped.effect(() => () => scope.dispose(), 'dsh-provider-cpa: settings mirror')
+
+        scoped.slots.inject(SETTINGS_SLOT, () => scoped.slots.register({
+          name: SETTINGS_SLOT,
+          id: SETTINGS_TAB_ID,
+          order: 30,
+          label: () => t('tab'),
+          locale: SETTINGS_LOCALE_NS,
+          inject: () => ({ api: remote, remote, scope }),
+        }, SettingsTab))
+      })
     }
 
     exports.apply = apply

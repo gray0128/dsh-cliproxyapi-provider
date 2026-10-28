@@ -18,10 +18,11 @@ test('client bundle registers a lifecycle-owned Plugins Settings tab', async () 
       assert.equal(id, 'react')
       return {}
     })
-    assert.deepEqual(plugin.inject, ['connection', 'remote', 'slots', 'locale', 'settingsScope'])
+    assert.deepEqual(plugin.inject, ['remote', 'slots', 'locale'])
 
     const registrations = []
     const injections = []
+    const serviceInjections = []
     const slots = {
       inject(name, callback) {
         injections.push(name)
@@ -43,40 +44,36 @@ test('client bundle registers a lifecycle-owned Plugins Settings tab', async () 
         return (key) => key
       },
     }
-    const scope = {
-      getSnapshot() {
-        return { status: 'loading', value: undefined, revision: undefined, writable: false }
-      },
-      subscribe() {
+    let effect
+    const remote = {
+      $on() {
         return () => {}
       },
-    }
-    const settingsScope = {
-      bind(spec) {
-        assert.deepEqual(spec, { namespace: 'llm-pi-ai' })
-        return scope
+      settings: {
+        async describe() {
+          return { ok: true, value: { writable: true, namespaces: [] } }
+        },
       },
     }
-    let effect
     const ctx = {
-      get(name) {
-        if (name === 'connection') return { api: {} }
-        if (name === 'remote') return { $on() { return () => {} } }
-        if (name === 'slots') return slots
-        if (name === 'locale') return locale
-        if (name === 'settingsScope') return settingsScope
-        throw new Error(`unexpected service: ${name}`)
-      },
+      remote,
       slots,
       locale,
-      settingsScope,
       effect(factory) {
         effect = factory
         return () => {}
       },
+      on() {
+        return () => {}
+      },
+      inject(deps, callback) {
+        serviceInjections.push(deps)
+        return callback(ctx)
+      },
     }
     plugin.apply(ctx)
     assert.equal(typeof effect, 'function')
+    assert.deepEqual(serviceInjections, [['remote', 'remote.settings', 'remote.credentials', 'remote.llm']])
     assert.deepEqual(injections, ['settings.plugins.tab'])
     assert.equal(registrations.length, 1)
     assert.equal(registrations[0].options.name, 'settings.plugins.tab')
@@ -97,11 +94,12 @@ test('client owns only its Settings slot and keeps the configuration accessible'
   assert.doesNotMatch(source, /querySelector(All)?\s*\(/)
   assert.doesNotMatch(source, /modelsHeading|configuredRows|BOOTSTRAP_ATTRIBUTE|HIDDEN_ATTRIBUTE/)
   assert.match(source, /settings\.plugins\.tab/)
-  assert.match(source, /ctx\.settingsScope/)
+  assert.doesNotMatch(source, /ctx\.settingsScope/)
+  assert.doesNotMatch(source, /connection'\)\.api|connection\?\.api/)
   assert.match(source, /slots\.inject\(SETTINGS_SLOT/)
   assert.match(source, /expectedRevision/)
   assert.match(source, /scope\.subscribe\(/)
-  assert.doesNotMatch(source, /remote\.\$on\('settings\/document-updated'/)
+  assert.match(source, /remote\.\$on\('settings\/document-updated'/)
   assert.match(source, /remote\.\$on\('credentials\/reference-updated'/)
   assert.match(source, /role: 'status'/)
 })
@@ -136,15 +134,18 @@ test('initial profile waits until the host writes complete model capabilities', 
       }, writable: true,
     }
     let bootstrap
+    let discoveryNamespace
     let discoveryRequest
-    const ok = (value) => ({ result: { ok: true, value } })
+    const ok = (value) => ({ ok: true, value })
     const api = {
       settings: {
         async describe() {
           return ok({ writable: true, hasDocument: true, namespaces: [currentNamespace] })
         },
-        async mutate(request) {
-          bootstrap = request.ops[0].value
+        async mutate(ns, ops, expectedRevision) {
+          assert.equal(ns, 'llm-pi-ai')
+          assert.equal(expectedRevision, currentNamespace.revision)
+          bootstrap = ops[0].value
           currentNamespace = {
             ns: 'llm-pi-ai', revision: 2, value: { providers: { CLIProxyAPI: bootstrap } },
           }
@@ -152,16 +153,18 @@ test('initial profile waits until the host writes complete model capabilities', 
         },
       },
       credentials: {
-        async describe() {
-          return ok({ credentials: { DSH_CLIPROXY_API_KEY: { configured: false } } })
+        async describe(refs) {
+          assert.deepEqual(refs, ['DSH_CLIPROXY_API_KEY'])
+          return ok({ DSH_CLIPROXY_API_KEY: { configured: false } })
         },
       },
       llm: {
-        async discoverModels(request) {
+        async discoverModels(settingsNs, request) {
+          discoveryNamespace = settingsNs
           discoveryRequest = request
-          return ok({ models: [{
+          return ok([{
             id: 'gpt-5.6-sol', name: 'GPT 5.6 Sol', contextWindow: 372000, maxTokens: 32768,
-          }] })
+          }])
         },
       },
     }
@@ -190,7 +193,7 @@ test('initial profile waits until the host writes complete model capabilities', 
       await new Promise((resolve) => setTimeout(resolve, 0))
     }
     assert.ok(bootstrap)
-    assert.equal(discoveryRequest.settingsNs, 'llm-cliproxyapi')
+    assert.equal(discoveryNamespace, 'llm-cliproxyapi')
     assert.equal(bootstrap.models[0].input, undefined)
     assert.equal(bootstrap.models[0].reasoningEfforts, undefined)
     assert.match(bootstrap.headers['x-dsh-provider-cpa-sync'], /^rich:/)
