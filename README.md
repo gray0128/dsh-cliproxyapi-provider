@@ -36,7 +36,7 @@ npx @deepseek-ai/dsh web
 
 ## 工作方式
 
-- **模型发现**：请求 `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider`，读取 Codex 风格的 `models` 数组，映射出模型 ID、显示名、上下文窗口、最大输出、输入模态和推理档位。缺少的字段回落到插件配置的默认值。
+- **模型发现**：并行请求 `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider`（Codex 风格 `models` 数组）与 `GET {baseURL}/models`（标准 OpenAI 风格 `data` 数组），按模型 ID 合并两边的容量、输入模态和思考档位；标准目录也能在 Codex 目录不可用时独立降级。缺少的字段回落到插件配置的默认值。
 - **单一目录所有者**：插件不注册自己的供应商目录，只维护 `llm-pi-ai` 里的 `CLIProxyAPI` 配置，路由和请求由内置 pi-ai 适配器负责。
 - **凭据**：API 密钥保存为 DSH 凭据 `DSH_CLIPROXY_API_KEY`，不写入配置文件。无密钥时写入一个占位 `Authorization` 头，保证请求仍能发出。
 - **刷新**：默认每 5 分钟刷新一次目录；失败时按 3 秒起步的指数退避重试，上限 60 秒，同一错误只记一条警告。
@@ -50,6 +50,8 @@ npx @deepseek-ai/dsh web
 | `defaultContextWindow` | `262144` | 目录未提供上下文窗口时使用的值 |
 | `defaultMaxTokens` | `32768` | 目录未提供最大输出时使用的值 |
 | `defaultInput` | `["text"]` | 目录未提供输入模态时使用的值，可含 `image` |
+| `excludedModels` | `[]` | 按模型 ID 隐藏模型，支持 `*` 通配符，例如 `["*-preview"]` |
+| `modelOverrides` | `{}` | 按模型 ID 覆盖 `name`、`contextWindow`、`maxTokens`、`input` 与 `reasoningEfforts`；`reasoningEfforts: false` 表示非推理模型 |
 | `headers` | `{}` | 请求目录和模型时附加的自定义请求头 |
 | `fetchTimeoutMs` | `15000` | 单次目录请求超时 |
 | `retryInitialMs` | `3000` | 首次重试延迟 |
@@ -68,7 +70,7 @@ npx @deepseek-ai/dsh plugin --profile web remove @gray0128/dsh-cliproxyapi-provi
 
 - **提示“与 DSH 不兼容”**：插件版本与当前 DSH 不匹配。请升级插件，不要用 `dsh plugin allow-version` 豁免——本插件依赖 0.2.1-rc.3 的宿主 API，绕过检查后仍会在加载时失败。
 - **返回 401 或 403**：在设置中保存有效的 API 密钥。
-- **保存后模型列表为空**：确认 CLIProxyAPI 的 `/models` 返回 Codex 风格的 `models` 数组，且至少包含一个可用模型。
+- **保存后模型列表为空**：确认 CLIProxyAPI 的 `/models` 返回 Codex 风格的 `models` 数组或标准 OpenAI 风格的 `data` 数组，且至少包含一个未被 `excludedModels` 过滤的可用模型。
 
 ## 许可
 

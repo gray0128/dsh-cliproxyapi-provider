@@ -139,9 +139,9 @@ test('registers rich discovery without competing for the provider directory', as
 
 test('initial discovery requests the fixed rich catalog and returns full capabilities', async () => {
   const previousFetch = globalThis.fetch
-  let requestURL
+  const requestURLs = []
   globalThis.fetch = async (url) => {
-    requestURL = String(url)
+    requestURLs.push(String(url))
     return new Response(JSON.stringify({ models: [{
       slug: 'gpt-5.6-sol',
       display_name: 'GPT 5.6 Sol',
@@ -159,10 +159,10 @@ test('initial discovery requests the fixed rich catalog and returns full capabil
       apiKey: 'secret-key',
       signal: new AbortController().signal,
     })
-    assert.equal(
-      requestURL,
+    assert.deepEqual(requestURLs.sort(), [
+      'http://127.0.0.1:8317/v1/models',
       'http://127.0.0.1:8317/v1/models?client_version=dsh-cliproxyapi-provider',
-    )
+    ])
     assert.deepEqual(models[0], {
       id: 'gpt-5.6-sol',
       name: 'GPT 5.6 Sol',
@@ -171,6 +171,148 @@ test('initial discovery requests the fixed rich catalog and returns full capabil
       input: ['text', 'image'],
       reasoningEfforts: { low: 'low', high: 'high' },
     })
+    harness.dispose()
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('merges standard catalog capacities into Codex discovery', async () => {
+  const previousFetch = globalThis.fetch
+  const requestURLs = []
+  globalThis.fetch = async (url) => {
+    const requestURL = String(url)
+    requestURLs.push(requestURL)
+    if (requestURL.includes('client_version=')) {
+      return new Response(JSON.stringify({ models: [{
+        slug: 'gpt-5.6-sol',
+        display_name: 'GPT 5.6 Sol',
+        max_context_window: 372000,
+        input_modalities: ['text', 'image'],
+        supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }],
+      }] }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ object: 'list', data: [{
+      id: 'gpt-5.6-sol',
+      context_length: 372000,
+      max_completion_tokens: 128000,
+    }] }), { status: 200 })
+  }
+  try {
+    const harness = createContext({ providers: {} })
+    apply(harness.ctx, await resolvedConfig())
+    const models = await harness.discoveries.get('llm-cliproxyapi')({
+      provider: 'CLIProxyAPI',
+      baseURL: 'http://127.0.0.1:8317/v1',
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(models[0], {
+      id: 'gpt-5.6-sol',
+      name: 'GPT 5.6 Sol',
+      contextWindow: 372000,
+      maxTokens: 128000,
+      input: ['text', 'image'],
+      reasoningEfforts: { low: 'low', high: 'high' },
+    })
+    assert.deepEqual(requestURLs.sort(), [
+      'http://127.0.0.1:8317/v1/models',
+      'http://127.0.0.1:8317/v1/models?client_version=dsh-cliproxyapi-provider',
+    ])
+    harness.dispose()
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('falls back to the standard catalog when the Codex catalog fails', async () => {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('client_version=')) {
+      return new Response(JSON.stringify({ error: 'unsupported' }), { status: 404 })
+    }
+    return new Response(JSON.stringify({ object: 'list', data: [
+      {
+        id: 'gemini-3-pro',
+        inputTokenLimit: 1048576,
+        outputTokenLimit: 65536,
+        supportedInputModalities: ['text', 'image'],
+      },
+      {
+        id: 'claude-opus-4-6',
+        context_length: 200000,
+        max_completion_tokens: 64000,
+        thinking: { levels: ['low', 'high'], zero_allowed: true },
+      },
+    ] }), { status: 200 })
+  }
+  try {
+    const harness = createContext({ providers: {} })
+    apply(harness.ctx, await resolvedConfig())
+    const models = await harness.discoveries.get('llm-cliproxyapi')({
+      provider: 'CLIProxyAPI',
+      baseURL: 'http://127.0.0.1:8317/v1',
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(models, [
+      {
+        id: 'gemini-3-pro',
+        name: 'gemini-3-pro',
+        contextWindow: 1048576,
+        maxTokens: 65536,
+        input: ['text', 'image'],
+      },
+      {
+        id: 'claude-opus-4-6',
+        name: 'claude-opus-4-6',
+        contextWindow: 200000,
+        maxTokens: 64000,
+        input: ['text'],
+        reasoningEfforts: { low: 'low', high: 'high', off: 'none' },
+      },
+    ])
+    harness.dispose()
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('applies excludedModels and modelOverrides during discovery', async () => {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('client_version=')) {
+      return new Response(JSON.stringify({ models: [
+        {
+          slug: 'gpt-5.6-sol',
+          max_context_window: 372000,
+          supported_reasoning_levels: [{ effort: 'high' }],
+        },
+        { slug: 'gpt-5.6-sol-preview', max_context_window: 372000 },
+        { slug: 'claude-opus-4-6', context_length: 200000 },
+      ] }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ object: 'list', data: [] }), { status: 200 })
+  }
+  try {
+    const harness = createContext({ providers: {
+      CLIProxyAPI: managedProfile(),
+    } })
+    apply(harness.ctx, await resolvedConfig({
+      excludedModels: ['*-preview'],
+      modelOverrides: {
+        'gpt-5.6-sol': {
+          contextWindow: 128000,
+          maxTokens: 64000,
+          reasoningEfforts: false,
+        },
+      },
+    }))
+    await waitFor(() => harness.mutations.length === 1)
+    const profile = harness.mutations[0][0].value
+    assert.deepEqual(profile.models.map((model) => model.id), ['gpt-5.6-sol', 'claude-opus-4-6'])
+    assert.equal(profile.models[0].contextWindow, 128000)
+    assert.equal(profile.models[0].maxTokens, 64000)
+    assert.equal(profile.models[0].reasoningEfforts, undefined)
+    assert.equal(profile.models[1].maxTokens, 32768)
     harness.dispose()
   } finally {
     globalThis.fetch = previousFetch
@@ -225,7 +367,7 @@ test('first profile synchronization restores capabilities stripped by the browse
 
     await waitFor(() => harness.mutations.length === 1)
     const profile = harness.mutations[0][0].value
-    assert.equal(fetches, 1)
+    assert.equal(fetches, 2)
     assert.equal(profile.headers[PROFILE_SYNC_HEADER], undefined)
     assert.deepEqual(profile.models[0], {
       id: 'gpt-5.6-sol',
@@ -242,7 +384,7 @@ test('first profile synchronization restores capabilities stripped by the browse
     await waitFor(() => harness.timeouts.some((row) => row.delay === 300000))
     const periodic = harness.timeouts.find((row) => row.delay === 300000)
     periodic.callback()
-    await waitFor(() => fetches === 2)
+    await waitFor(() => fetches === 4)
     await waitFor(() => harness.timeouts.filter((row) => row.delay === 300000).length === 2)
     harness.dispose()
   } finally {
@@ -310,7 +452,7 @@ test('keyless profiles omit apiKeyEnv and receive a non-sensitive placeholder he
     harness.emit('settings/document-updated', 'llm-pi-ai')
     await new Promise((resolve) => setTimeout(resolve, 25))
     assert.equal(harness.mutations.length, 1)
-    assert.equal(fetches, 1)
+    assert.equal(fetches, 2)
     harness.dispose()
   } finally {
     globalThis.fetch = previousFetch
@@ -329,7 +471,7 @@ test('refreshIntervalMs zero disables healthy periodic refreshes', async () => {
       CLIProxyAPI: managedProfile(),
     } })
     apply(harness.ctx, await resolvedConfig({ refreshIntervalMs: 0 }))
-    await waitFor(() => fetches === 1)
+    await waitFor(() => fetches === 2)
     await new Promise((resolve) => setTimeout(resolve, 25))
     assert.equal(harness.timeouts.length, 0)
     harness.dispose()

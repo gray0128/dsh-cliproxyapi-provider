@@ -36,7 +36,7 @@ On save, the plugin writes the models into the `CLIProxyAPI` entry of the built-
 
 ## How it works
 
-- **Model discovery**: requests `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider` and reads a Codex-style `models` array, mapping model ID, display name, context window, max output, input modalities, and reasoning levels. Missing fields fall back to the plugin defaults.
+- **Model discovery**: requests `GET {baseURL}/models?client_version=dsh-cliproxyapi-provider` (Codex-style `models` array) and `GET {baseURL}/models` (standard OpenAI-style `data` array) in parallel, merging capacity, input modalities, and reasoning levels by model ID. The standard catalog also serves as a fallback when the Codex catalog is unavailable. Missing fields fall back to the plugin defaults.
 - **Single directory owner**: the plugin registers no provider directory of its own. It only maintains the `CLIProxyAPI` entry inside `llm-pi-ai`, and the built-in pi-ai adapter owns routing and requests.
 - **Credentials**: the API key is stored as the DSH credential `DSH_CLIPROXY_API_KEY` and never written to the configuration file. Without a key the plugin sends a placeholder `Authorization` header so requests still go out.
 - **Refresh**: the catalog refreshes every 5 minutes by default. Failures retry with exponential backoff from 3 seconds up to 60 seconds, and an unchanged error is logged once.
@@ -50,6 +50,8 @@ The defaults suit most deployments. To change them, set `config` on the `llm-cli
 | `defaultContextWindow` | `262144` | Context window used when the catalog omits one |
 | `defaultMaxTokens` | `32768` | Max output used when the catalog omits one |
 | `defaultInput` | `["text"]` | Input modalities used when the catalog omits them; may include `image` |
+| `excludedModels` | `[]` | Hides models by ID; supports the `*` wildcard, for example `["*-preview"]` |
+| `modelOverrides` | `{}` | Per-model overrides for `name`, `contextWindow`, `maxTokens`, `input`, and `reasoningEfforts`; `reasoningEfforts: false` declares a non-reasoning model |
 | `headers` | `{}` | Extra request headers for catalog and model requests |
 | `fetchTimeoutMs` | `15000` | Timeout for one catalog request |
 | `retryInitialMs` | `3000` | First retry delay |
@@ -68,7 +70,7 @@ Restart DeepSeek Harness Web after uninstalling.
 
 - **“incompatible with DSH” warning**: the plugin version does not match the running DSH. Upgrade the plugin rather than granting `dsh plugin allow-version` — it relies on the 0.2.1-rc.3 host APIs and would still fail to load once the check is bypassed.
 - **401 or 403**: save a valid API key in Settings.
-- **Empty model list after saving**: make sure CLIProxyAPI answers `/models` with a Codex-style `models` array holding at least one usable model.
+- **Empty model list after saving**: make sure CLIProxyAPI answers `/models` with a Codex-style `models` array or a standard OpenAI-style `data` array holding at least one model not hidden by `excludedModels`.
 
 ## License
 

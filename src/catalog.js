@@ -14,61 +14,232 @@ function nonEmptyString(...values) {
   }
 }
 
+function isPresent(value) {
+  if (value === undefined || value === null) return false
+  if (typeof value === 'string') return value.trim().length > 0
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value).length > 0
+  return true
+}
+
 function normalizeReasoningLevel(value) {
   const wire = nonEmptyString(value)?.toLowerCase()
   if (!wire) return undefined
-  if (wire === 'none' || wire === 'off') return { canonical: 'off', wire: 'none' }
-  if (wire === 'ultra') return { canonical: 'max', wire }
-  if (!CANONICAL_REASONING_LEVELS.has(wire)) return undefined
-  return { canonical: wire, wire }
+  if (wire === 'off') return { canonical: 'off', wire: 'none', standard: true }
+  if (CANONICAL_REASONING_LEVELS.has(wire)) return { canonical: wire, wire, standard: true }
+  if (wire === 'none') return { canonical: 'off', wire: 'none', standard: false }
+  if (wire === 'ultra') return { canonical: 'max', wire: 'ultra', standard: false }
+  return undefined
+}
+
+function reasoningLevelsOf(entry) {
+  const declared = entry?.supported_reasoning_levels
+  if (Array.isArray(declared) && declared.length) {
+    return declared.map((raw) => (typeof raw === 'string' ? raw : raw?.effort))
+  }
+  const levels = entry?.thinking?.levels
+  if (!Array.isArray(levels) || !levels.length) return []
+  const values = levels.map((raw) => (typeof raw === 'string' ? raw : raw?.effort ?? raw?.level))
+  if (entry.thinking.zero_allowed === true) {
+    const lowered = values.map((raw) => nonEmptyString(raw)?.toLowerCase())
+    if (!lowered.includes('off') && !lowered.includes('none')) values.push('none')
+  }
+  return values
 }
 
 export function reasoningEffortsOf(entry) {
-  if (!Array.isArray(entry?.supported_reasoning_levels)) return undefined
+  const levels = reasoningLevelsOf(entry)
+    .map(normalizeReasoningLevel)
+    .filter(Boolean)
+  if (!levels.length) return undefined
   const efforts = {}
-  for (const raw of entry.supported_reasoning_levels) {
-    const normalized = normalizeReasoningLevel(typeof raw === 'string' ? raw : raw?.effort)
-    if (normalized && !(normalized.canonical in efforts)) efforts[normalized.canonical] = normalized.wire
+  // Canonical names win over aliases regardless of the upstream array order.
+  for (const level of levels) {
+    if (level.standard) efforts[level.canonical] = level.wire
+  }
+  for (const level of levels) {
+    if (!level.standard && !(level.canonical in efforts)) efforts[level.canonical] = level.wire
   }
   // llm-pi-ai rejects a capability map that offers only "off". Omitting the
   // field correctly describes a non-reasoning model for a hand-declared route.
-  if (Object.keys(efforts).every((level) => level === 'off')) return undefined
-  return Object.keys(efforts).length ? efforts : undefined
+  if (!Object.keys(efforts).length || Object.keys(efforts).every((level) => level === 'off')) return undefined
+  return efforts
 }
 
-function inputModalitiesOf(entry, fallback) {
-  if (!Array.isArray(entry?.input_modalities)) return [...fallback]
+function modalitiesOf(values) {
+  if (!Array.isArray(values)) return []
   const modalities = []
   const seen = new Set()
-  for (const raw of entry.input_modalities) {
+  for (const raw of values) {
     const value = nonEmptyString(raw)?.toLowerCase()
     if ((value === 'text' || value === 'image') && !seen.has(value)) {
       seen.add(value)
       modalities.push(value)
     }
   }
-  return modalities.length ? modalities : [...fallback]
+  return modalities
+}
+
+function inputModalitiesOf(entry, fallback) {
+  for (const field of ['input_modalities', 'supportedInputModalities']) {
+    const modalities = modalitiesOf(entry?.[field])
+    if (modalities.length) return modalities
+  }
+  return [...fallback]
+}
+
+function overrideInputModalities(value) {
+  const modalities = modalitiesOf(value)
+  return modalities.length ? modalities : undefined
+}
+
+function isExcludedModel(id, patterns) {
+  if (!Array.isArray(patterns)) return false
+  return patterns.some((raw) => {
+    const pattern = nonEmptyString(raw)
+    if (!pattern) return false
+    if (!pattern.includes('*')) return pattern === id
+    const expression = pattern
+      .split('*')
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('.*')
+    return new RegExp('^' + expression + '$').test(id)
+  })
+}
+
+function modelOverrideOf(options, id) {
+  const overrides = options.modelOverrides
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return undefined
+  if (!Object.hasOwn(overrides, id)) return undefined
+  const override = overrides[id]
+  return override && typeof override === 'object' && !Array.isArray(override) ? override : undefined
+}
+
+function overriddenReasoningEfforts(override, id) {
+  if (!override || !Object.hasOwn(override, 'reasoningEfforts')) return { applied: false }
+  const value = override.reasoningEfforts
+  if (value === undefined) return { applied: false }
+  if (value === false) return { applied: true }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(
+      `modelOverrides[${JSON.stringify(id)}].reasoningEfforts must be false or a reasoning level map`,
+    )
+  }
+  const efforts = {}
+  for (const [key, wire] of Object.entries(value)) {
+    const normalized = normalizeReasoningLevel(wire)
+    if (!normalized) {
+      throw new TypeError(
+        `modelOverrides[${JSON.stringify(id)}].reasoningEfforts.${key} is not a supported reasoning level`,
+      )
+    }
+    if (normalized.canonical !== key) {
+      throw new TypeError(
+        `modelOverrides[${JSON.stringify(id)}].reasoningEfforts.${key} maps to `
+        + `"${normalized.canonical}", not "${key}"`,
+      )
+    }
+    efforts[normalized.canonical] = normalized.wire
+  }
+  // An empty or off-only map cannot be represented in llm-pi-ai; ignore the
+  // override instead of writing a capability map the host would reject.
+  if (!Object.keys(efforts).length || Object.keys(efforts).every((level) => level === 'off')) {
+    return { applied: false }
+  }
+  return { applied: true, efforts }
 }
 
 export function modelProfileOf(entry, options = {}) {
   const id = nonEmptyString(entry?.slug, entry?.id, entry?.model)
   if (!id || (!options.includeHiddenModels && entry?.visibility === 'hide')) return undefined
-  const reasoningEfforts = reasoningEffortsOf(entry)
+  if (isExcludedModel(id, options.excludedModels)) return undefined
+  const override = modelOverrideOf(options, id)
+
+  const contextWindow = positiveInteger(
+    override?.contextWindow,
+    entry?.max_context_window,
+    entry?.context_window,
+    entry?.context_length,
+    entry?.inputTokenLimit,
+    entry?.max_input_tokens,
+    options.defaultContextWindow,
+  )
+  const explicitMaxTokens = positiveInteger(override?.maxTokens)
+  let maxTokens = explicitMaxTokens ?? positiveInteger(
+    entry?.max_output_tokens,
+    entry?.max_completion_tokens,
+    entry?.outputTokenLimit,
+    entry?.max_tokens,
+    options.defaultMaxTokens,
+  )
+  if (
+    explicitMaxTokens === undefined
+    && positiveInteger(contextWindow) !== undefined
+    && positiveInteger(maxTokens) !== undefined
+  ) {
+    maxTokens = Math.min(contextWindow, maxTokens)
+  }
+
+  const reasoningOverride = overriddenReasoningEfforts(override, id)
+  const reasoningEfforts = reasoningOverride.applied
+    ? reasoningOverride.efforts
+    : reasoningEffortsOf(entry)
+
   return {
     id,
-    name: nonEmptyString(entry?.display_name, entry?.name, entry?.description, id),
-    contextWindow: positiveInteger(entry?.max_context_window, entry?.context_window, options.defaultContextWindow),
-    maxTokens: positiveInteger(entry?.max_output_tokens, entry?.max_completion_tokens, entry?.max_tokens, options.defaultMaxTokens),
-    input: inputModalitiesOf(entry, options.defaultInput ?? ['text']),
+    name: nonEmptyString(
+      override?.name,
+      entry?.display_name,
+      entry?.displayName,
+      entry?.name,
+      entry?.description,
+      id,
+    ),
+    contextWindow,
+    maxTokens,
+    input: overrideInputModalities(override?.input) ?? inputModalitiesOf(entry, options.defaultInput ?? ['text']),
     ...(reasoningEfforts ? { reasoningEfforts } : {}),
   }
 }
 
+export function catalogEntriesOf(body) {
+  if (Array.isArray(body?.models)) return body.models
+  if (Array.isArray(body?.data)) return body.data
+  return undefined
+}
+
+function mergedEntryOf(primary, supplement) {
+  const merged = { ...supplement }
+  for (const [key, value] of Object.entries(primary)) {
+    if (isPresent(value) || !(key in merged)) merged[key] = value
+  }
+  return merged
+}
+
+export function mergeCatalogPayloads(primaryBody, supplementBody) {
+  const primary = catalogEntriesOf(primaryBody)
+  if (!primary) return supplementBody ?? primaryBody
+  const supplement = catalogEntriesOf(supplementBody)
+  if (!supplement) return primaryBody
+  const supplements = new Map()
+  for (const entry of supplement) {
+    const id = nonEmptyString(entry?.slug, entry?.id, entry?.model)
+    if (id !== undefined && !supplements.has(id)) supplements.set(id, entry)
+  }
+  const models = primary.map((entry) => {
+    const id = nonEmptyString(entry?.slug, entry?.id, entry?.model)
+    const extra = id === undefined ? undefined : supplements.get(id)
+    return extra === undefined ? entry : mergedEntryOf(entry, extra)
+  })
+  return { ...primaryBody, models }
+}
+
 export function readCodexCatalog(body, options = {}) {
-  if (!body || !Array.isArray(body.models)) throw new TypeError('CLIProxyAPI model catalog has no "models" array')
+  const entries = catalogEntriesOf(body)
+  if (!entries) throw new TypeError('CLIProxyAPI model catalog has no "models" or "data" array')
   const models = []
   const seen = new Set()
-  for (const entry of body.models) {
+  for (const entry of entries) {
     const model = modelProfileOf(entry, options)
     if (!model || seen.has(model.id)) continue
     seen.add(model.id)
@@ -78,9 +249,17 @@ export function readCodexCatalog(body, options = {}) {
   return models
 }
 
-export function catalogURL(baseURL) {
+function catalogBase(baseURL) {
   const base = String(baseURL ?? '').trim().replace(/\/+$/, '')
   if (!base) throw new TypeError('CLIProxyAPI baseURL must not be empty')
+  return base
+}
+
+export function catalogURL(baseURL) {
   const query = new URLSearchParams({ client_version: 'dsh-cliproxyapi-provider' })
-  return base + '/models?' + query
+  return catalogBase(baseURL) + '/models?' + query
+}
+
+export function standardCatalogURL(baseURL) {
+  return catalogBase(baseURL) + '/models'
 }

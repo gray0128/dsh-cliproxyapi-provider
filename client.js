@@ -210,6 +210,10 @@ window.__ModuleLoader__.load({
           name: model.name || model.id,
           contextWindow: model.contextWindow || 262144,
           maxTokens: model.maxTokens || 32768,
+          ...(Array.isArray(model.input) && model.input.length ? { input: model.input } : {}),
+          ...(model.reasoningEfforts && Object.keys(model.reasoningEfforts).length
+            ? { reasoningEfforts: model.reasoningEfforts }
+            : {}),
         })),
         defaultContextWindow: 262144,
         defaultMaxTokens: 32768,

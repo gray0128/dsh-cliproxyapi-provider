@@ -3,7 +3,13 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assertUsableApiKey, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { Config as PiAiConfig } from '@deepseek-ai/dsh-llm-pi-ai'
 import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
-import { catalogURL, readCodexCatalog } from './catalog.js'
+import {
+  catalogEntriesOf,
+  catalogURL,
+  mergeCatalogPayloads,
+  readCodexCatalog,
+  standardCatalogURL,
+} from './catalog.js'
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024
 const DISCOVERY_HANDOFF_TTL_MS = 60000
@@ -19,10 +25,20 @@ export const PLACEHOLDER_AUTHORIZATION = 'Bearer dsh-cliproxyapi-no-key'
 export const name = 'llm-cliproxyapi'
 export const inject = ['settings', 'credentials', 'llm', 'timer']
 
+const ModelOverrideSchema = z.object({
+  name: z.string(),
+  contextWindow: z.number().step(1).min(1),
+  maxTokens: z.number().step(1).min(1),
+  input: z.array(z.union(['text', 'image'])),
+  reasoningEfforts: z.union([z.const(false), z.dict(z.string())]),
+})
+
 export const Config = z.object({
   defaultContextWindow: z.number().step(1).min(1).default(262144),
   defaultMaxTokens: z.number().step(1).min(1).default(32768),
   defaultInput: z.array(z.union(['text', 'image'])).default(['text']),
+  excludedModels: z.array(z.string()).default([]),
+  modelOverrides: z.dict(ModelOverrideSchema).default({}),
   headers: z.dict(z.string()).default({}),
   fetchTimeoutMs: z.number().step(1).min(1).default(15000),
   retryInitialMs: z.number().step(1).min(1).default(3000),
@@ -148,37 +164,67 @@ async function readBoundedJson(response) {
   return JSON.parse(new TextDecoder().decode(bytes))
 }
 
+async function fetchCatalogBody(url, options, apiKey, signal) {
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      signal,
+      headers: {
+        accept: 'application/json',
+        ...options.headers,
+        ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}),
+        ...attributionHeaders(),
+      },
+    })
+  } catch (error) {
+    if (signal.aborted) throw signal.reason ?? error
+    throw new Error('Could not reach CLIProxyAPI at ' + url, { cause: error })
+  }
+  if (!response.ok) {
+    throw new Error('CLIProxyAPI model catalog answered ' + response.status + ((response.status === 401 || response.status === 403) ? '; save a valid API key in Settings' : ''))
+  }
+  try {
+    return await readBoundedJson(response)
+  } catch (error) {
+    if (signal.aborted) throw signal.reason ?? error
+    throw new Error('CLIProxyAPI model catalog did not return usable JSON', { cause: error })
+  }
+}
+
+function hasCatalogEntries(body) {
+  return (catalogEntriesOf(body)?.length ?? 0) > 0
+}
+
 async function discoverCatalog(ctx, options, suppliedApiKey, parentSignal) {
   const apiKey = await optionalApiKey(ctx, suppliedApiKey)
   const baseURL = normalizedBaseURL(options.baseURL)
-  const url = catalogURL(baseURL)
+  const primaryURL = catalogURL(baseURL)
+  const standardURL = standardCatalogURL(baseURL)
   const request = timedSignal(parentSignal, options.fetchTimeoutMs)
   try {
-    let response
-    try {
-      response = await fetch(url, {
-        method: 'GET',
-        signal: request.signal,
-        headers: {
-          accept: 'application/json',
-          ...options.headers,
-          ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}),
-          ...attributionHeaders(),
-        },
-      })
-    } catch (error) {
-      if (request.signal.aborted) throw request.signal.reason ?? error
-      throw new Error('Could not reach CLIProxyAPI at ' + url, { cause: error })
-    }
-    if (!response.ok) {
-      throw new Error('CLIProxyAPI model catalog answered ' + response.status + ((response.status === 401 || response.status === 403) ? '; save a valid API key in Settings' : ''))
+    // Codex clients get a rich catalog while standard OpenAI clients get the
+    // channel registry. Query both and let the richer payload win per model.
+    const [primary, standard] = await Promise.allSettled([
+      fetchCatalogBody(primaryURL, options, apiKey, request.signal),
+      fetchCatalogBody(standardURL, options, apiKey, request.signal),
+    ])
+    if (request.signal.aborted) {
+      throw request.signal.reason ?? new Error('CLIProxyAPI model catalog request was aborted')
     }
     let body
-    try {
-      body = await readBoundedJson(response)
-    } catch (error) {
-      if (request.signal.aborted) throw request.signal.reason ?? error
-      throw new Error('CLIProxyAPI model catalog did not return usable JSON', { cause: error })
+    if (primary.status === 'fulfilled' && hasCatalogEntries(primary.value)) {
+      body = standard.status === 'fulfilled'
+        ? mergeCatalogPayloads(primary.value, standard.value)
+        : primary.value
+    } else if (standard.status === 'fulfilled' && hasCatalogEntries(standard.value)) {
+      body = standard.value
+    } else if (primary.status === 'rejected') {
+      throw primary.reason
+    } else if (primary.status === 'fulfilled') {
+      body = primary.value
+    } else {
+      throw standard.reason
     }
     try {
       return {
@@ -186,7 +232,11 @@ async function discoverCatalog(ctx, options, suppliedApiKey, parentSignal) {
         hasApiKey: apiKey !== undefined,
       }
     } catch (error) {
-      throw new Error('Expected the CLIProxyAPI Codex catalog with a "models" array', { cause: error })
+      throw new Error(
+        'Could not read the CLIProxyAPI model catalog: '
+        + (error instanceof Error ? error.message : String(error)),
+        { cause: error },
+      )
     }
   } finally {
     request.dispose()
@@ -209,6 +259,8 @@ function refreshKeyOf(profile, config) {
     defaultContextWindow: profile.defaultContextWindow,
     defaultMaxTokens: profile.defaultMaxTokens,
     defaultInput: profile.defaultInput,
+    excludedModels: config.excludedModels,
+    modelOverrides: config.modelOverrides,
     headers: sortedHeaders(catalogHeadersOf(profile.headers, config.headers)),
   })
 }
@@ -261,6 +313,8 @@ export function apply(ctx, config) {
     defaultContextWindow: config.defaultContextWindow,
     defaultMaxTokens: config.defaultMaxTokens,
     defaultInput: config.defaultInput,
+    excludedModels: config.excludedModels,
+    modelOverrides: config.modelOverrides,
     headers: catalogHeadersOf(profile.headers, config.headers),
     fetchTimeoutMs: config.fetchTimeoutMs,
   }, undefined, signal)
@@ -295,6 +349,8 @@ export function apply(ctx, config) {
       defaultContextWindow: config.defaultContextWindow,
       defaultMaxTokens: config.defaultMaxTokens,
       defaultInput: config.defaultInput,
+      excludedModels: config.excludedModels,
+      modelOverrides: config.modelOverrides,
       headers: config.headers,
       fetchTimeoutMs: config.fetchTimeoutMs,
     }, request.apiKey, request.signal)
