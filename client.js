@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@router-for-me/dsh-cliproxyapi-provider',
+  id: '@gray0128/dsh-cliproxyapi-provider',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
