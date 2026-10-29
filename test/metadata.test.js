@@ -11,6 +11,8 @@ import {
   createMetadataResolver,
   entryNeedsCalibration,
   isBareModelEntry,
+  isCodexReasoningTemplate,
+  isPlaceholderContext,
   isSyntheticCodexTemplate,
   isSyntheticMaxTokens,
   loadPiAiMetadataIndex,
@@ -46,6 +48,39 @@ test('detects synthetic max tokens including 100% and OpenRouter 90% caps', () =
   assert.equal(isSyntheticMaxTokens(1048576, 943718), true)
   assert.equal(isSyntheticMaxTokens(1000000, 128000), false)
   assert.equal(isSyntheticMaxTokens(200000, 64000), false)
+})
+
+test('pins placeholder context and synthetic-cap boundaries', () => {
+  for (const value of [500000, 872000, '500000', ' 872000 ']) {
+    assert.equal(isPlaceholderContext(value), true, String(value))
+  }
+  for (const value of [499999, 500001, 871999, 872001, 262144, 0, -1, 500000.5, null, undefined]) {
+    assert.equal(isPlaceholderContext(value), false, String(value))
+  }
+
+  // A cap that consumes the whole window is synthesized at any size.
+  assert.equal(isSyntheticMaxTokens(16384, 16384), true)
+  assert.equal(isSyntheticMaxTokens(65536, 65536), true)
+  assert.equal(isSyntheticMaxTokens(65536, 32768), false)
+
+  assert.equal(isSyntheticMaxTokens(200000, 200000), true)
+  assert.equal(isSyntheticMaxTokens(200000, 200001), true)
+  assert.equal(isSyntheticMaxTokens(200000, 199999), false)
+
+  // 90% estimate with one token of rounding slack on either side.
+  for (const context of [1000000, 1048576, 1000005]) {
+    const estimate = Math.round(context * 0.9)
+    for (const delta of [-1, 0, 1]) {
+      assert.equal(isSyntheticMaxTokens(context, estimate + delta), true, `${context}:${delta}`)
+    }
+    assert.equal(isSyntheticMaxTokens(context, estimate - 2), false, `${context}:-2`)
+    assert.equal(isSyntheticMaxTokens(context, estimate + 2), false, `${context}:+2`)
+  }
+
+  assert.equal(isSyntheticMaxTokens(1048576, 128000), false)
+  assert.equal(isSyntheticMaxTokens(200000, 64000), false)
+  assert.equal(isSyntheticMaxTokens(undefined, 128000), false)
+  assert.equal(isSyntheticMaxTokens(200000, undefined), false)
 })
 
 test('merges metadata across pi-ai, OpenRouter, and LiteLLM by priority while rejecting synthetic caps', () => {
@@ -136,6 +171,124 @@ test('merges metadata across pi-ai, OpenRouter, and LiteLLM by priority while re
   assert.equal(lookupModelMetadata('text-embedding-3-large', [liteLlmIndex]), undefined)
 })
 
+test('detects placeholder context sizes and CLIProxyAPI level templates', () => {
+  assert.equal(isPlaceholderContext(500000), true)
+  assert.equal(isPlaceholderContext(872000), true)
+  assert.equal(isPlaceholderContext('500000'), true)
+  assert.equal(isPlaceholderContext(500001), false)
+  assert.equal(isPlaceholderContext(undefined), false)
+
+  const levels = ['low', 'medium', 'high', 'xhigh', 'max']
+  assert.equal(isCodexReasoningTemplate({ slug: 'claude-opus-5-5', supported_reasoning_levels: levels }), true)
+  assert.equal(isCodexReasoningTemplate({ slug: 'claude-opus-5-5', supported_reasoning_levels: [...levels, 'ultra'] }), true)
+  assert.equal(isCodexReasoningTemplate({
+    slug: 'claude-opus-5-5',
+    supported_reasoning_levels: ['minimal', ...levels],
+  }), true)
+  assert.equal(isCodexReasoningTemplate({ slug: 'claude-opus-5-5', thinking: { levels: ['low', 'medium', 'high', 'xhigh', 'ultra'] } }), true)
+  assert.equal(isCodexReasoningTemplate({ slug: 'plain', supported_reasoning_levels: ['low', 'high'] }), false)
+
+  // Real publishers of these lists keep their levels.
+  for (const slug of ['gemini-3-flash', 'grok-4.6', 'grok-4.7-build-fast', 'gpt-5.6-sol', 'codex-mini', 'o3-mini']) {
+    assert.equal(isCodexReasoningTemplate({ slug, supported_reasoning_levels: levels }), false, slug)
+  }
+  assert.equal(isCodexReasoningTemplate({ slug: 'gpt-oss-120b-medium', supported_reasoning_levels: levels }), true)
+  assert.equal(isSyntheticCodexTemplate({ slug: 'plain', context_window: 500000 }), true)
+  assert.equal(isSyntheticCodexTemplate({ slug: 'claude-opus-5-5', supported_reasoning_levels: levels }), true)
+})
+
+test('clears a placeholder level template and keeps a placeholder context when no metadata matches', () => {
+  const entry = {
+    slug: 'claude-sonnet-4-5-intl',
+    context_window: 500000,
+    input_modalities: ['text'],
+    supported_reasoning_levels: [
+      { effort: 'low' },
+      { effort: 'medium' },
+      { effort: 'high' },
+      { effort: 'xhigh' },
+      { effort: 'max' },
+      { effort: 'ultra' },
+    ],
+  }
+  assert.equal(entryNeedsCalibration(entry), true)
+
+  const [model] = readCatalog(calibrateCatalogPayload({ models: [entry] }, []), defaults)
+  assert.deepEqual(model, {
+    id: 'claude-sonnet-4-5-intl',
+    name: 'claude-sonnet-4-5-intl',
+    contextWindow: 500000,
+    maxTokens: 32768,
+    input: ['text'],
+  })
+})
+
+test('replaces a level template only when metadata corroborates it', () => {
+  const index = buildOpenRouterMetadataIndex({ data: [{
+    id: 'vendor/claude-sonnet-4-5-intl',
+    context_length: 200000,
+    top_provider: { max_completion_tokens: 64000 },
+    architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+    reasoning: { supported_efforts: ['low', 'medium', 'high'] },
+  }] })
+  const [model] = readCatalog(calibrateCatalogPayload({ models: [{
+    slug: 'claude-sonnet-4-5-intl',
+    context_window: 500000,
+    max_context_window: 872000,
+    supported_reasoning_levels: [
+      { effort: 'low' }, { effort: 'medium' }, { effort: 'high' }, { effort: 'xhigh' }, { effort: 'max' },
+    ],
+  }] }, [index]), defaults)
+
+  assert.deepEqual(model, {
+    id: 'claude-sonnet-4-5-intl',
+    name: 'claude-sonnet-4-5-intl',
+    contextWindow: 200000,
+    maxTokens: 64000,
+    input: ['text', 'image'],
+    reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' },
+  })
+})
+
+test('falls back to boundary-aware fuzzy matching for unknown vendor suffixes', () => {
+  const suffixIndex = buildOpenRouterMetadataIndex({ data: [{
+    id: 'minimax/minimax-m3-instruct',
+    context_length: 512000,
+    top_provider: { max_completion_tokens: 128000 },
+    architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+  }] })
+  assert.equal(lookupModelMetadata('cn/minimax-m3', [suffixIndex])?.contextWindow, 512000)
+
+  const shortIndex = buildOpenRouterMetadataIndex({ data: [{
+    id: 'minimax/minimax-m3',
+    context_length: 256000,
+    top_provider: { max_completion_tokens: 64000 },
+    architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+  }] })
+  assert.equal(lookupModelMetadata('cn/minimax-m3-instruct', [shortIndex])?.contextWindow, 256000)
+  assert.equal(lookupModelMetadata('cn/unrelated', [suffixIndex]), undefined)
+})
+
+test('prefers the newest OpenRouter snapshot and indexes its Hugging Face id', () => {
+  const index = buildOpenRouterMetadataIndex({ data: [
+    {
+      id: 'vendor/model',
+      created: 1,
+      context_length: 100000,
+      architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+    },
+    {
+      id: 'vendor/model',
+      created: 2,
+      context_length: 200000,
+      hugging_face_id: 'org/model',
+      architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+    },
+  ] })
+  assert.equal(lookupModelMetadata('vendor/model', [index])?.contextWindow, 200000)
+  assert.equal(lookupModelMetadata('org/model', [index])?.contextWindow, 200000)
+})
+
 test('calibrates CLIProxyAPI synthetic Codex templates, empty reasoning arrays, synthetic maxTokens, and bare entries', async () => {
   const piAiIndex = await loadPiAiMetadataIndex()
   assert.ok(piAiIndex.size > 0)
@@ -194,19 +347,14 @@ test('calibrates CLIProxyAPI synthetic Codex templates, empty reasoning arrays, 
   )
   const models = readCatalog(payload, defaults)
 
+  // pi-ai knows the model supports reasoning but publishes no level map, so the
+  // synthetic Codex levels are dropped instead of being forwarded as real ones.
   assert.deepEqual(models[0], {
     id: 'claude-sonnet-4-5-intl',
     name: 'claude-sonnet-4-5-intl',
     contextWindow: 200000,
     maxTokens: 64000,
     input: ['text', 'image'],
-    reasoningEfforts: {
-      low: 'low',
-      medium: 'medium',
-      high: 'high',
-      xhigh: 'xhigh',
-      max: 'max',
-    },
   })
 
   assert.deepEqual(models[1], {

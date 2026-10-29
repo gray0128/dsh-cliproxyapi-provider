@@ -2,12 +2,22 @@ const CANONICAL_REASONING_LEVELS = [
   'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
 ]
 const CANONICAL_REASONING_SET = new Set(CANONICAL_REASONING_LEVELS)
-const SYNTHETIC_CODEX_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
-const DEFAULT_REASONING_EFFORTS = {
-  low: 'low',
-  medium: 'medium',
-  high: 'high',
-}
+// CLIProxyAPI reuses these context sizes as a fallback template for routes that
+// do not report real capacity, so neither value can be trusted on its own.
+const PLACEHOLDER_CONTEXT_WINDOWS = new Set([500000, 872000])
+// Level lists CLIProxyAPI synthesizes for every route. A model family that
+// really publishes one of these lists is exempted by `isRealTemplateVariant`.
+const CODEX_TEMPLATE_LEVEL_SETS = [
+  ['low', 'medium', 'high', 'xhigh', 'max'],
+  ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  ['low', 'medium', 'high', 'xhigh', 'ultra'],
+  ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+]
+const CODEX_FAMILY_RE = /(?:^|[^a-z0-9])(?:codex|gpt-[56]|o[345])(?=[^0-9]|$)/
+const REAL_LEVEL_VARIANT_RES = [
+  /^gemini[.-]/,
+  /^grok-4[.-][67](?=[^0-9]|$)/,
+]
 const NON_CHAT_MODES = new Set([
   'embedding',
   'rerank',
@@ -77,18 +87,17 @@ function validContextWindow(...values) {
   }
 }
 
+export function isPlaceholderContext(contextWindow) {
+  return PLACEHOLDER_CONTEXT_WINDOWS.has(positiveInt(contextWindow))
+}
+
 export function isSyntheticMaxTokens(contextWindow, maxTokens) {
-  if (!contextWindow || contextWindow <= 65536 || !maxTokens) return false
+  if (!contextWindow || !maxTokens) return false
   if (maxTokens >= contextWindow) return true
   // OpenRouter synthesizes `Math.floor(context_length * 0.9)` when a provider
-  // does not report a real output token limit.
-  if (
-    maxTokens === Math.floor(contextWindow * 0.9)
-    || maxTokens === Math.round(contextWindow * 0.9)
-  ) {
-    return true
-  }
-  return false
+  // does not report a real output token limit; allow one token of rounding
+  // slack on either side of the estimate.
+  return Math.abs(maxTokens - Math.round(contextWindow * 0.9)) <= 1
 }
 
 function validMaxTokens(contextWindow, ...values) {
@@ -348,8 +357,11 @@ export function buildOpenRouterMetadataIndex(payload) {
       : Array.isArray(payload)
         ? payload
         : []
-  for (const entry of list) {
-    if (!entry || typeof entry !== 'object') continue
+  const entries = list
+    .filter((entry) => entry && typeof entry === 'object')
+    // Newer snapshots win when several entries normalize to the same key.
+    .sort((left, right) => (Number(right?.created) || 0) - (Number(left?.created) || 0))
+  for (const entry of entries) {
     const id = typeof entry.id === 'string' ? entry.id.trim() : ''
     if (!id) continue
     const outputModalities = entry?.architecture?.output_modalities ?? entry?.modalities?.output
@@ -386,6 +398,9 @@ export function buildOpenRouterMetadataIndex(payload) {
     registerModelKeys(map, id, spec, 70)
     if (typeof entry?.canonical_slug === 'string' && entry.canonical_slug.trim()) {
       registerModelKeys(map, entry.canonical_slug.trim(), spec, 68)
+    }
+    if (typeof entry?.hugging_face_id === 'string' && entry.hugging_face_id.trim()) {
+      registerModelKeys(map, entry.hugging_face_id.trim(), spec, 66)
     }
   }
   return map
@@ -438,6 +453,66 @@ export function buildLiteLlmMetadataIndex(payload) {
   return map
 }
 
+const sortedKeysCache = new WeakMap()
+
+function sortedKeysOf(index) {
+  let keys = sortedKeysCache.get(index)
+  if (!keys) {
+    keys = [...index.keys()].sort()
+    sortedKeysCache.set(index, keys)
+  }
+  return keys
+}
+
+function firstKeyWithPrefix(keys, prefix) {
+  let low = 0
+  let high = keys.length
+  while (low < high) {
+    const middle = (low + high) >>> 1
+    if (keys[middle] < prefix) low = middle + 1
+    else high = middle
+  }
+  return low
+}
+
+function rawTailOf(modelId) {
+  const raw = String(modelId ?? '').trim().toLowerCase()
+  return raw.slice(raw.lastIndexOf('/') + 1).replace(/^~/, '')
+}
+
+function normalizedTailOf(modelId) {
+  return rawTailOf(modelId).replace(/[._\s]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
+}
+
+// Last-resort match for proxy route ids that carry a vendor suffix the
+// canonicalization rules do not know (for example `minimax-m3-instruct`).
+function fuzzyBestForTail(index, tail) {
+  if (!tail || tail.length < 4) return undefined
+  const keys = sortedKeysOf(index)
+  let best
+  const consider = (key) => {
+    const hit = index.get(key)
+    if (!hit) return
+    const distance = Math.abs(key.length - tail.length)
+    if (
+      !best
+      || distance < best.distance
+      || (distance === best.distance && (hit.priority > best.priority
+        || (hit.priority === best.priority && key < best.key)))
+    ) {
+      best = { key, distance, priority: hit.priority, spec: hit.spec }
+    }
+  }
+  const extended = tail + '-'
+  for (let i = firstKeyWithPrefix(keys, extended); i < keys.length && keys[i].startsWith(extended); i += 1) {
+    consider(keys[i])
+  }
+  for (let i = tail.indexOf('-'); i > 0; i = tail.indexOf('-', i + 1)) {
+    consider(tail.slice(0, i))
+  }
+  return best
+}
+
 export function lookupModelMetadata(modelId, indexes) {
   if (!Array.isArray(indexes) || !indexes.length) return undefined
   const candidates = candidateKeysForModelId(modelId)
@@ -461,6 +536,17 @@ export function lookupModelMetadata(modelId, indexes) {
       combined = mergeSpecs(combined, best.spec)
     }
   }
+  if (combined !== undefined) return combined
+  const tails = [...new Set([normalizedTailOf(modelId), rawTailOf(modelId)])].filter(Boolean)
+  for (const index of indexes) {
+    if (!(index instanceof Map) || !index.size) continue
+    let best
+    for (const tail of tails) {
+      const hit = fuzzyBestForTail(index, tail)
+      if (hit && (!best || hit.distance < best.distance)) best = hit
+    }
+    if (best) combined = mergeSpecs(combined, best.spec)
+  }
   return combined
 }
 
@@ -482,21 +568,65 @@ function rawMaxOutputOf(entry) {
   )
 }
 
+function levelValueOf(item) {
+  if (typeof item === 'string') return item
+  if (!item || typeof item !== 'object') return ''
+  const value = item.effort ?? item.name ?? item.id ?? item.value ?? item.level
+  return typeof value === 'string' ? value : ''
+}
+
+function rawReasoningLevelsOf(entry) {
+  const source = Array.isArray(entry?.supported_reasoning_levels)
+    ? entry.supported_reasoning_levels
+    : Array.isArray(entry?.thinking?.levels)
+      ? entry.thinking.levels
+      : []
+  return source
+    .map((item) => levelValueOf(item).trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function hasDeclaredInput(entry) {
+  return ['input_modalities', 'supportedInputModalities'].some((field) => {
+    return Array.isArray(entry?.[field]) && entry[field].length > 0
+  })
+}
+
+function hasEmptyReasoningLevels(entry) {
+  return (
+    Array.isArray(entry?.supported_reasoning_levels) && entry.supported_reasoning_levels.length === 0
+  ) || (
+    Array.isArray(entry?.thinking?.levels) && entry.thinking.levels.length === 0
+  )
+}
+
+function isRealTemplateVariant(id) {
+  const text = String(id ?? '').toLowerCase()
+  const bare = text.slice(text.lastIndexOf('/') + 1)
+  return REAL_LEVEL_VARIANT_RES.some((pattern) => pattern.test(bare))
+    || CODEX_FAMILY_RE.test(bare)
+}
+
+/**
+ * Detect the level lists CLIProxyAPI synthesizes for routes without a real
+ * thinking definition. Real publishers of the same lists (Gemini, Grok 4.6/4.7,
+ * and the Codex/GPT-5/GPT-6/o-series families) are exempt.
+ */
+export function isCodexReasoningTemplate(entry, id = entryIdOf(entry)) {
+  if (!entry || typeof entry !== 'object') return false
+  const levels = rawReasoningLevelsOf(entry)
+  if (!levels.length) return false
+  const unique = new Set(levels)
+  if (unique.size !== levels.length) return false
+  if (isRealTemplateVariant(id)) return false
+  return CODEX_TEMPLATE_LEVEL_SETS.some((template) => {
+    return template.length === unique.size && template.every((level) => unique.has(level))
+  })
+}
+
 export function isSyntheticCodexTemplate(entry) {
   if (!entry || typeof entry !== 'object') return false
-  if (rawMaxOutputOf(entry) !== undefined) return false
-  if (entry.context_window === 500000 && entry.max_context_window === 872000) {
-    return true
-  }
-  const levels = Array.isArray(entry.supported_reasoning_levels)
-    ? entry.supported_reasoning_levels.map((item) => {
-      return String(typeof item === 'string' ? item : item?.effort ?? '').trim().toLowerCase()
-    })
-    : []
-  return (
-    levels.length === SYNTHETIC_CODEX_LEVELS.length
-    && SYNTHETIC_CODEX_LEVELS.every((level, index) => levels[index] === level)
-  )
+  return isPlaceholderContext(rawContextOf(entry)) || isCodexReasoningTemplate(entry)
 }
 
 export function isBareModelEntry(entry) {
@@ -507,65 +637,74 @@ export function isBareModelEntry(entry) {
 
 export function entryNeedsCalibration(entry) {
   if (!entry || typeof entry !== 'object') return false
-  if (isSyntheticCodexTemplate(entry) || isBareModelEntry(entry)) return true
   const rawContext = rawContextOf(entry)
   const rawMaxOutput = rawMaxOutputOf(entry)
-  if (rawContext && isSyntheticMaxTokens(rawContext, rawMaxOutput)) return true
-  if (Array.isArray(entry.supported_reasoning_levels) && entry.supported_reasoning_levels.length === 0) {
-    return true
-  }
+  if (rawContext === undefined || isPlaceholderContext(rawContext)) return true
+  if (rawMaxOutput === undefined || isSyntheticMaxTokens(rawContext, rawMaxOutput)) return true
+  if (!hasDeclaredInput(entry)) return true
+  if (isCodexReasoningTemplate(entry)) return true
+  if (hasEmptyReasoningLevels(entry)) return true
   return false
 }
 
 export function calibrateCatalogEntry(entry, metadata) {
-  if (!entry || typeof entry !== 'object' || !metadata) return entry
-  const synthetic = isSyntheticCodexTemplate(entry)
-  const bare = isBareModelEntry(entry)
+  if (!entry || typeof entry !== 'object') return entry
+  const meta = metadata && typeof metadata === 'object' ? metadata : {}
   const rawContext = rawContextOf(entry)
   const rawMaxOutput = rawMaxOutputOf(entry)
+  const placeholderContext = isPlaceholderContext(rawContext)
+  const placeholderMax = isSyntheticMaxTokens(rawContext, rawMaxOutput)
+  const bare = isBareModelEntry(entry)
+  const missingLevels = rawReasoningLevelsOf(entry).length === 0
 
   const next = { ...entry }
 
-  // 1. Context window: calibrate when CLIProxyAPI used its synthetic Codex
-  // template or omitted context capacity entirely.
-  if (metadata.contextWindow && (synthetic || !rawContext)) {
-    next.max_context_window = metadata.contextWindow
-    next.context_window = metadata.contextWindow
+  // 1. Context window: replace the CLIProxyAPI placeholder sizes or fill a
+  // missing capacity. A non-placeholder declaration always wins.
+  if (meta.contextWindow && (placeholderContext || rawContext === undefined)) {
+    next.max_context_window = meta.contextWindow
+    next.context_window = meta.contextWindow
   }
 
-  const effectiveContext = rawContextOf(next) ?? metadata.contextWindow
-
-  // 2. Max output tokens: calibrate when synthetic template, bare `/v1/models`
-  // entry, or erroneously set to a synthetic cap (>= contextWindow or 90%).
-  if (
-    metadata.maxTokens
-    && (synthetic || bare || (rawMaxOutput !== undefined && isSyntheticMaxTokens(effectiveContext, rawMaxOutput)))
-  ) {
-    next.max_output_tokens = metadata.maxTokens
+  // 2. Max output tokens: replace a synthetic cap (>= contextWindow or 90% of
+  // it). Without metadata the placeholder is dropped so the configured default
+  // applies instead of a fabricated budget.
+  if (meta.maxTokens && (placeholderMax || rawMaxOutput === undefined)) {
+    next.max_output_tokens = meta.maxTokens
+  } else if (placeholderMax) {
+    delete next.max_output_tokens
+    delete next.max_completion_tokens
+    delete next.max_tokens
+    delete next.outputTokenLimit
   }
 
-  // 3. Input modalities: calibrate when synthetic template or bare entry.
-  if (metadata.input && (synthetic || bare)) {
-    next.input_modalities = [...metadata.input]
+  // 3. Input modalities: only fill what the proxy did not declare.
+  if (meta.input && !hasDeclaredInput(entry)) {
+    next.input_modalities = [...meta.input]
   }
 
-  // 4. Reasoning efforts: if CLIProxyAPI did not explicitly disable thinking,
-  // calibrate when CLIProxyAPI left supported_reasoning_levels empty ([]),
-  // used its synthetic template, or returned a bare `/v1/models` entry.
+  // 4. Reasoning efforts: replace placeholder/empty level lists. A template
+  // that metadata cannot corroborate is cleared instead of being passed on as
+  // a fabricated capability; an explicit "no thinking" declaration is kept.
   const explicitlyDisabled = entry.thinking === false
     || entry.reasoning === false
     || (typeof entry.thinking?.type === 'string' && entry.thinking.type.trim().toLowerCase() === 'disabled')
   if (!explicitlyDisabled) {
-    const emptyCodexLevels = Array.isArray(entry.supported_reasoning_levels)
-      && entry.supported_reasoning_levels.length === 0
-    if (metadata.reasoningEfforts && (synthetic || bare || emptyCodexLevels)) {
-      next.supported_reasoning_levels = Object.entries(metadata.reasoningEfforts).map(([, wire]) => ({
+    const needsLevels = isCodexReasoningTemplate(entry)
+      || hasEmptyReasoningLevels(entry)
+      || (bare && missingLevels)
+    if (needsLevels && meta.reasoningEfforts) {
+      next.supported_reasoning_levels = Object.entries(meta.reasoningEfforts).map(([, wire]) => ({
         effort: wire,
       }))
-    } else if ((bare || emptyCodexLevels) && metadata.reasoning === true && !entry.thinking?.levels) {
-      next.supported_reasoning_levels = Object.entries(DEFAULT_REASONING_EFFORTS).map(([, wire]) => ({
-        effort: wire,
-      }))
+      if (Array.isArray(next.thinking?.levels)) {
+        next.thinking = { ...next.thinking, levels: [] }
+      }
+    } else if (needsLevels) {
+      if (next.supported_reasoning_levels !== undefined) next.supported_reasoning_levels = []
+      if (Array.isArray(next.thinking?.levels)) {
+        next.thinking = { ...next.thinking, levels: [] }
+      }
     }
   }
 
@@ -581,17 +720,13 @@ function entryIdOf(item) {
 }
 
 export function calibrateCatalogPayload(body, indexes) {
-  if (!body || typeof body !== 'object' || !Array.isArray(indexes) || !indexes.length) {
-    return body
-  }
-  const hasAnyEntries = indexes.some((index) => index instanceof Map && index.size > 0)
-  if (!hasAnyEntries) return body
+  if (!body || typeof body !== 'object') return body
+  const lookupIndexes = Array.isArray(indexes) ? indexes : []
   const calibrateItem = (item) => {
     if (!entryNeedsCalibration(item)) return item
     const id = entryIdOf(item)
     if (!id) return item
-    const metadata = lookupModelMetadata(id, indexes)
-    return metadata ? calibrateCatalogEntry(item, metadata) : item
+    return calibrateCatalogEntry(item, lookupModelMetadata(id, lookupIndexes))
   }
   if (Array.isArray(body)) return body.map(calibrateItem)
   if (Array.isArray(body.models)) {
@@ -683,7 +818,22 @@ function isEntrySatisfied(entry, indexes) {
   const id = entryIdOf(entry)
   if (!id) return true
   const meta = lookupModelMetadata(id, indexes)
-  return Boolean(meta?.contextWindow && meta?.maxTokens)
+  if (!meta) return false
+  const rawContext = rawContextOf(entry)
+  if ((rawContext === undefined || isPlaceholderContext(rawContext)) && !meta.contextWindow) return false
+  const rawMaxOutput = rawMaxOutputOf(entry)
+  const effectiveContext = rawContext ?? meta.contextWindow
+  if (
+    (rawMaxOutput === undefined || isSyntheticMaxTokens(effectiveContext, rawMaxOutput))
+    && !meta.maxTokens
+  ) {
+    return false
+  }
+  if (isCodexReasoningTemplate(entry) || hasEmptyReasoningLevels(entry)) {
+    if (!meta.reasoningEfforts && meta.reasoning === undefined) return false
+  }
+  if (!hasDeclaredInput(entry) && !meta.input) return false
+  return true
 }
 
 export function createMetadataResolver(options = {}) {

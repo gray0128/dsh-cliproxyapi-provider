@@ -1,6 +1,9 @@
-const CANONICAL_REASONING_LEVELS = new Set([
+import { isSyntheticMaxTokens } from './metadata.js'
+
+const CANONICAL_REASONING_LEVELS = [
   'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
-])
+]
+const CANONICAL_REASONING_SET = new Set(CANONICAL_REASONING_LEVELS)
 const DEFAULT_CONTEXT_WINDOW = 262144
 const DEFAULT_MAX_TOKENS = 32768
 const DEFAULT_INPUT = ['text']
@@ -39,20 +42,26 @@ function normalizeReasoningLevel(value) {
   const wire = nonEmptyString(value)?.toLowerCase()
   if (!wire) return undefined
   if (wire === 'off') return { canonical: 'off', wire: 'none', standard: true }
-  if (CANONICAL_REASONING_LEVELS.has(wire)) return { canonical: wire, wire, standard: true }
+  if (CANONICAL_REASONING_SET.has(wire)) return { canonical: wire, wire, standard: true }
   if (wire === 'none') return { canonical: 'off', wire: 'none', standard: false }
   if (wire === 'ultra') return { canonical: 'max', wire: 'ultra', standard: false }
   return undefined
 }
 
+function reasoningLevelValueOf(item) {
+  if (typeof item === 'string') return item
+  if (!item || typeof item !== 'object') return undefined
+  return item.effort ?? item.name ?? item.id ?? item.value ?? item.level
+}
+
 function reasoningLevelsOf(entry) {
   const declared = entry?.supported_reasoning_levels
   if (Array.isArray(declared) && declared.length) {
-    return declared.map((raw) => (typeof raw === 'string' ? raw : raw?.effort))
+    return declared.map(reasoningLevelValueOf)
   }
   const levels = entry?.thinking?.levels
   if (!Array.isArray(levels) || !levels.length) return []
-  const values = levels.map((raw) => (typeof raw === 'string' ? raw : raw?.effort ?? raw?.level))
+  const values = levels.map(reasoningLevelValueOf)
   if (entry.thinking.zero_allowed === true) {
     const lowered = values.map((raw) => nonEmptyString(raw)?.toLowerCase())
     if (!lowered.includes('off') && !lowered.includes('none')) values.push('none')
@@ -73,9 +82,15 @@ export function reasoningEffortsOf(entry) {
   for (const level of levels) {
     if (!level.standard && !(level.canonical in efforts)) efforts[level.canonical] = level.wire
   }
+  // Emit a stable low-to-high order so selectors do not follow the upstream
+  // array, which varies between the two CLIProxyAPI endpoints.
+  const ordered = {}
+  for (const level of CANONICAL_REASONING_LEVELS) {
+    if (level in efforts) ordered[level] = efforts[level]
+  }
   // llm-pi-ai rejects a capability map that offers only "off". Omitting the
   // field correctly describes a non-reasoning model for a hand-declared route.
-  return usableReasoningEfforts(efforts)
+  return usableReasoningEfforts(ordered)
 }
 
 function modalitiesOf(values) {
@@ -166,25 +181,36 @@ export function modelProfileOf(entry, options = {}) {
   if (isExcludedModel(id, options.excludedModels)) return undefined
   const override = modelOverrideOf(options, id)
 
-  const contextWindow = positiveInteger(
-    override?.contextWindow,
+  const declaredContextWindow = positiveInteger(
     entry?.max_context_window,
     entry?.context_window,
     entry?.context_length,
     entry?.inputTokenLimit,
     entry?.max_input_tokens,
+  )
+  const contextWindow = positiveInteger(
+    override?.contextWindow,
+    declaredContextWindow,
     options.defaultContextWindow,
     DEFAULT_CONTEXT_WINDOW,
   )
   const explicitMaxTokens = positiveInteger(override?.maxTokens)
-  let maxTokens = explicitMaxTokens ?? positiveInteger(
+  const declaredMaxTokens = positiveInteger(
     entry?.max_output_tokens,
     entry?.max_completion_tokens,
     entry?.outputTokenLimit,
     entry?.max_tokens,
-    options.defaultMaxTokens,
-    DEFAULT_MAX_TOKENS,
   )
+  let maxTokens = explicitMaxTokens ?? declaredMaxTokens
+  // A budget equal to the context window (or 90% of it) is a synthesized cap,
+  // not a declaration. Drop it so the configured default applies instead of
+  // handing the route an output budget it cannot honor.
+  if (
+    maxTokens === undefined
+    || (explicitMaxTokens === undefined && isSyntheticMaxTokens(declaredContextWindow, maxTokens))
+  ) {
+    maxTokens = positiveInteger(options.defaultMaxTokens, DEFAULT_MAX_TOKENS)
+  }
   if (
     explicitMaxTokens === undefined
     && positiveInteger(contextWindow) !== undefined

@@ -252,12 +252,15 @@ async function resolveCatalogModels(primary, standard, options, metadataResolver
   for (const body of candidates) {
     let calibrated = body
     if (metadataResolver) {
+      let indexes = []
       try {
-        const indexes = await metadataResolver.resolveIndexesForPayloads([body], parentSignal)
-        if (indexes.length) calibrated = calibrateCatalogPayload(body, indexes)
+        indexes = await metadataResolver.resolveIndexesForPayloads([body], parentSignal)
       } catch {
-        calibrated = body
+        indexes = []
       }
+      // Calibration also strips placeholder values that no metadata source
+      // could confirm, so it runs even when every source is unavailable.
+      calibrated = calibrateCatalogPayload(body, indexes)
     }
     try {
       return readCatalog(calibrated, options)

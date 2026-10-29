@@ -36,6 +36,30 @@ test('prefers the canonical max level over ultra regardless of order', () => {
   ] }), { max: 'ultra' })
 })
 
+test('reads reasoning level aliases and emits a stable canonical order', () => {
+  assert.deepEqual(Object.keys(reasoningEffortsOf({ supported_reasoning_levels: [
+    { name: 'high' }, { value: 'none' }, { id: 'low' },
+  ] })), ['off', 'low', 'high'])
+  assert.deepEqual(Object.keys(reasoningEffortsOf({ thinking: {
+    levels: [{ level: 'max' }, { level: 'minimal' }],
+  } })), ['minimal', 'max'])
+})
+
+test('replaces a synthesized output cap with the configured default', () => {
+  assert.equal(modelProfileOf({
+    slug: 'synthetic-full', context_window: 1048576, max_tokens: 1048576,
+  }, defaults).maxTokens, 32768)
+  assert.equal(modelProfileOf({
+    slug: 'synthetic-ninety', context_window: 1000000, max_tokens: 900000,
+  }, defaults).maxTokens, 32768)
+  assert.equal(modelProfileOf({
+    slug: 'real-output', context_window: 1000000, max_tokens: 128000,
+  }, defaults).maxTokens, 128000)
+  assert.equal(modelProfileOf({
+    slug: 'override-wins', context_window: 1000000, max_tokens: 1000000,
+  }, { ...defaults, modelOverrides: { 'override-wins': { maxTokens: 64000 } } }).maxTokens, 64000)
+})
+
 test('reads thinking levels and zero_allowed from the standard catalog', () => {
   assert.deepEqual(reasoningEffortsOf({ thinking: {
     levels: ['low', 'high'],
@@ -246,6 +270,23 @@ test('ignores empty or off-only reasoning overrides and rejects mismatched ones'
     ...defaults,
     modelOverrides: { thinker: { reasoningEfforts: { high: 'ultra' } } },
   }), /maps to "max", not "high"/)
+})
+
+test('does not treat explicit overrides as synthesized caps', () => {
+  assert.equal(modelProfileOf({
+    slug: 'override-boundary', context_window: 500000, max_tokens: 450000,
+  }, {
+    ...defaults,
+    modelOverrides: { 'override-boundary': { maxTokens: 450000 } },
+  }).maxTokens, 450000)
+  // A context-sized cap is replaced even for small windows; the configured
+  // default is then clamped to the window.
+  assert.equal(modelProfileOf({
+    slug: 'mid-window', context_window: 65536, max_tokens: 65536,
+  }, defaults).maxTokens, 32768)
+  assert.equal(modelProfileOf({
+    slug: 'small-window', context_window: 16384, max_tokens: 16384,
+  }, defaults).maxTokens, 16384)
 })
 
 test('builds the Codex-compatible and standard catalog URLs', () => {

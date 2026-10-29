@@ -1,6 +1,6 @@
 {
   "name": "@gray0128/dsh-cliproxyapi-provider",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "GUI-configurable CLIProxyAPI Responses provider for DeepSeek Harness",
   "type": "module",
   "main": "./src/index.js",
@@ -12,14 +12,22 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
-  "files": ["src", "client.js", "cordis.patch.yml", "README.md", "README_EN.md"],
+  "files": [
+    "src",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README_EN.md"
+  ],
   "scripts": {
     "test": "node --test",
     "check": "node --check src/index.js && node --check src/catalog.js && node --check src/metadata.js && node --check client.js && node --test",
     "pack:github": "npm pack"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-connection",
@@ -64,7 +72,10 @@
     "@deepseek-ai/dsh-util-values": "0.2.1-rc.3",
     "@deepseek-ai/schemastery": "3.18.5"
   },
-  "engines": { "node": ">=22", "dsh": ">=0.2.1-rc.3 <0.2.2-0" },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.1-rc.3 <0.2.2-0"
+  },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"

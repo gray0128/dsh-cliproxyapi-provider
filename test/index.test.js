@@ -17,7 +17,9 @@ import {
 } from '../src/index.js'
 
 async function resolvedConfig(overrides = {}) {
-  const result = await Config['~standard'].validate(overrides)
+  // Discovery tests run without metadata calibration; metadata coverage lives
+  // in metadata.test.js and the dedicated calibration case below.
+  const result = await Config['~standard'].validate({ metadataSources: [], ...overrides })
   assert.equal(result.issues, undefined)
   return result.value
 }
@@ -703,6 +705,7 @@ test('real Cordis composition leaves llm-pi-ai as the sole directory owner', asy
       apply: applyPiAi,
     }, { providers: {} })
     const cpaFiber = ctx.plugin({ name: 'llm-cliproxyapi', inject: ['settings', 'credentials', 'llm', 'timer'], Config, apply }, {
+      metadataSources: [],
       retryInitialMs: 10,
       retryMaxMs: 20,
     })
@@ -839,6 +842,7 @@ test('calibrates incomplete or synthetic CLIProxyAPI entries from prioritized me
   try {
     const harness = createContext({ providers: {} })
     apply(harness.ctx, await resolvedConfig({
+      metadataSources: ['pi-ai', 'openrouter', 'litellm'],
       openRouterModelsURL: 'https://openrouter.test/api/v1/models',
       liteLlmModelsURL: 'https://litellm.test/models.json',
     }))
@@ -863,26 +867,21 @@ test('calibrates incomplete or synthetic CLIProxyAPI entries from prioritized me
         max: 'max',
       },
     })
+    // The proxy's 6-level Codex template is not corroborated by any source, so
+    // it is dropped rather than forwarded as a fake capability.
     assert.deepEqual(discovered[1], {
       id: 'claude-sonnet-4-5-intl',
       name: 'claude-sonnet-4-5-intl',
       contextWindow: 200000,
       maxTokens: 64000,
       input: ['text', 'image'],
-      reasoningEfforts: {
-        low: 'low',
-        medium: 'medium',
-        high: 'high',
-        xhigh: 'xhigh',
-        max: 'max',
-      },
     })
     assert.deepEqual(discovered[2], {
       id: 'openrouter-calibrated',
       name: 'OpenRouter Calibrated',
       contextWindow: 256000,
       maxTokens: 64000,
-      input: ['text', 'image'],
+      input: ['text'],
       reasoningEfforts: {
         low: 'low',
         medium: 'medium',
